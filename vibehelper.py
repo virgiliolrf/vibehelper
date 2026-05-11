@@ -259,6 +259,16 @@ class Session:
         # When set, the suggestions extractor stands down — the autopilot
         # monitor owns this tile's response buffer.
         self.autopilot_loop_id: Optional[str] = None
+        # per-turn auto-commit state. `turn_count` ticks every time the
+        # drainer (or initial bootstrap) dispatches a non-/clear prompt;
+        # `_commit_monitor` commits at most once per turn, on a per-session
+        # vibe branch, so every turn is reversible with `git checkout HEAD~1`.
+        self.turn_count: int = 0
+        self.last_committed_turn: int = -1
+        self.vibe_branch: Optional[str] = None
+        self.starting_branch: Optional[str] = None
+        self.commits: list[dict] = []
+        self.commit_monitor_task: Optional[asyncio.Task] = None
 
     def is_ready_for_input(self) -> bool:
         """True when the agent finished booting and is idle — safe to type a
@@ -623,6 +633,9 @@ async def _session_drainer(sess: "Session") -> None:
             sess.response_buffer = bytearray()
             sess.tracking_response = True
             sess.last_suggestions = None
+            # one turn = one dispatched prompt; commit monitor uses this
+            # to fire exactly one auto-commit per turn.
+            sess.turn_count += 1
         # offload the blocking write (sleep + CR) to a thread so the loop
         # can keep pumping bytes through other sessions' websockets.
         await asyncio.to_thread(_submit_to_session, sess, line)
@@ -797,6 +810,193 @@ def _update_suggestions_state(sess: "Session") -> None:
         sess.suggestion_extract_task = asyncio.create_task(_extract_suggestions(sess, buf))
 
 
+# ── live git diff + auto-commit per turn ─────────────────────────────────────
+#
+# Each tile runs in a project folder; whenever the agent finishes a turn we
+# auto-commit the working tree on a per-session vibe/<sid>-<timestamp> branch
+# with a Llama-generated conventional commit message. Every turn becomes a
+# rewindable checkpoint (`git checkout HEAD~1`). The frontend diff panel
+# polls /api/git/{sid} to show the live diff vs HEAD plus the commit log.
+
+GIT_DIFF_CAP = 32768  # bytes; UI scrolls fine well past this but we cap to keep poll cheap
+
+
+def _run_git(folder: str, args: list[str], timeout: float = 15.0) -> str:
+    """Run a git command in `folder`. Raises on non-zero exit. Output is
+    captured (stdout returned, stderr raised with the command)."""
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=folder,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {proc.stderr.strip()[:400]}")
+    return proc.stdout
+
+
+def _is_git_repo(folder: str) -> bool:
+    try:
+        _run_git(folder, ["rev-parse", "--git-dir"])
+        return True
+    except Exception:
+        return False
+
+
+def _collect_git_state(sess: "Session") -> dict:
+    """Snapshot of the tile folder's git state for the diff panel."""
+    folder = sess.folder
+    if not _is_git_repo(folder):
+        return {"folder": folder, "is_repo": False}
+    try:
+        branch = _run_git(folder, ["rev-parse", "--abbrev-ref", "HEAD"]).strip()
+        status = _run_git(folder, ["status", "--porcelain"]).strip()
+        diff = _run_git(folder, ["diff", "HEAD", "--no-color"])
+        truncated = False
+        if len(diff) > GIT_DIFF_CAP:
+            diff = diff[:GIT_DIFF_CAP]
+            truncated = True
+        log = _run_git(folder, ["log", "--oneline", "-15"]).strip()
+    except Exception as e:
+        return {"folder": folder, "is_repo": True, "error": str(e)[:300]}
+    return {
+        "folder": folder,
+        "is_repo": True,
+        "branch": branch,
+        "status": status,
+        "diff": diff,
+        "diff_truncated": truncated,
+        "log": log,
+        "vibe_branch": sess.vibe_branch,
+        "starting_branch": sess.starting_branch,
+        "commits": sess.commits[-12:],
+    }
+
+
+async def _llama_commit_message(sess: "Session", stat: str) -> str:
+    """Ask Groq for a one-line conventional commit message tied to the
+    prompt that drove these changes. Empty string on any failure — caller
+    falls back to a generic 'vibe: turn N' message."""
+    if groq_client is None:
+        return ""
+    user = (
+        "Write a single conventional commit message line for the changes below. "
+        "Format: <type>(<scope>): <summary>. Type ∈ feat | fix | refactor | "
+        "test | docs | chore | perf | style. Imperative voice, ≤72 chars total, "
+        "no period at the end, no markdown, no quotes. Reply with ONLY the "
+        "message line, nothing else.\n\n"
+        f"USER PROMPT that drove these changes:\n{(sess.last_prompt or '(none)')[:600]}\n\n"
+        f"FILES CHANGED (git diff --stat):\n{stat[:1500]}\n"
+    )
+    try:
+        resp = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": user}],
+            max_tokens=40,
+            temperature=0,
+        )
+        msg = (resp.choices[0].message.content or "").strip().splitlines()[0].strip()
+        msg = msg.strip("`'\"").strip()
+        return msg[:120]
+    except Exception:
+        return ""
+
+
+async def _autocommit_tile(sess: "Session") -> None:
+    """Stage + commit the tile folder's current diff onto its vibe branch.
+    Creates the branch on first commit. Skips when there's nothing to
+    commit. Uses --no-verify because the auto-commit feature exists
+    precisely to make every turn reversible — a blocking pre-commit hook
+    would defeat that. Errors are logged, never raised."""
+    folder = sess.folder
+    if not _is_git_repo(folder):
+        return
+    # ensure we're on a vibe/* branch — create one from current HEAD on
+    # first commit, or adopt the current branch if it already looks like one.
+    if sess.vibe_branch is None:
+        try:
+            cur = (await asyncio.to_thread(_run_git, folder, ["rev-parse", "--abbrev-ref", "HEAD"])).strip()
+        except Exception:
+            cur = ""
+        sess.starting_branch = cur or "HEAD"
+        if cur.startswith("vibe/"):
+            sess.vibe_branch = cur
+        else:
+            ts = time.strftime("%y%m%d-%H%M%S")
+            sid_prefix = sess.sid.replace("/", "-")[:8]
+            target = f"vibe/{sid_prefix}-{ts}"
+            try:
+                await asyncio.to_thread(_run_git, folder, ["checkout", "-b", target])
+                sess.vibe_branch = target
+            except Exception as e:
+                print(f"[autocommit] {sess.sid} branch create failed: {e}")
+                return
+    # stage everything, then check if there's anything to commit
+    try:
+        await asyncio.to_thread(_run_git, folder, ["add", "-A"])
+        stat = await asyncio.to_thread(_run_git, folder, ["diff", "--cached", "--stat", "--no-color"])
+    except Exception as e:
+        print(f"[autocommit] {sess.sid} stage failed: {e}")
+        return
+    if not stat.strip():
+        return
+    msg = await _llama_commit_message(sess, stat)
+    if not msg:
+        msg = f"vibe: turn {sess.turn_count} on {sess.sid}"
+    try:
+        await asyncio.to_thread(_run_git, folder, ["commit", "-m", msg, "--no-verify"])
+        sha = (await asyncio.to_thread(_run_git, folder, ["rev-parse", "--short", "HEAD"])).strip()
+    except Exception as e:
+        print(f"[autocommit] {sess.sid} commit failed: {e}")
+        return
+    sess.commits.append({
+        "sha": sha,
+        "message": msg,
+        "turn": sess.turn_count,
+        "timestamp": time.time(),
+        "stat": stat.strip()[:600],
+    })
+    if len(sess.commits) > 120:
+        sess.commits = sess.commits[-120:]
+
+
+async def _commit_monitor(sess: "Session") -> None:
+    """Per-session worker: fires _autocommit_tile at most once per turn.
+    Waits for the tile to settle (idle + ≥2.5s since last byte) so the
+    commit captures the full set of changes from that turn."""
+    while sess.alive:
+        await asyncio.sleep(1.0)
+        if sess.last_committed_turn >= sess.turn_count:
+            continue
+        if sess.status() != "idle":
+            continue
+        if time.time() - sess.last_byte_at < 2.5:
+            continue
+        target = sess.turn_count
+        try:
+            await _autocommit_tile(sess)
+        except Exception as e:
+            print(f"[commit_monitor] {sess.sid}: {e}")
+        sess.last_committed_turn = target
+
+
+def _ensure_commit_monitor(sess: "Session") -> None:
+    """Idempotent starter, mirrors _ensure_drainer."""
+    if sess.commit_monitor_task is None or sess.commit_monitor_task.done():
+        sess.commit_monitor_task = asyncio.create_task(_commit_monitor(sess))
+
+
+@app.get("/api/git/{sid}")
+async def api_git(sid: str):
+    sess = SESSIONS.get(sid)
+    if sess is None:
+        return JSONResponse({"ok": False, "error": "unknown tile"}, status_code=404)
+    info = await asyncio.to_thread(_collect_git_state, sess)
+    return {"ok": True, **info}
+
+
 # ── autopilot (self-driving loop on a single tile toward a goal) ─────────────
 #
 # The operator hands a high-level goal; Llama judges the agent's output after
@@ -875,6 +1075,12 @@ AUTOPILOTS: Dict[str, AutopilotLoop] = {}
 
 
 def _autopilot_snapshot(loop: AutopilotLoop) -> dict:
+    # strip the bulky response_excerpt from per-iteration entries — the
+    # snapshot rides on every /api/state poll, so we keep it light.
+    iters_lite = [
+        {k: v for k, v in it.items() if k != "response_excerpt"}
+        for it in loop.iterations[-10:]
+    ]
     return {
         "loop_id": loop.loop_id,
         "sid": loop.sid,
@@ -885,7 +1091,7 @@ def _autopilot_snapshot(loop: AutopilotLoop) -> dict:
         "last_verdict": loop.last_verdict,
         "last_narration": loop.last_narration,
         "awaiting_decision": loop.awaiting_decision,
-        "iterations": loop.iterations[-10:],
+        "iterations": iters_lite,
         "updated_at": loop.updated_at,
     }
 
@@ -935,10 +1141,17 @@ async def _autopilot_judge(loop: AutopilotLoop, response_bytes: bytes) -> dict:
         return {"verdict": "pause", "reasoning": f"judge error: {e}", "narration": "judge call failed"}
 
 
+AUTOPILOT_STUCK_SEC = 600.0  # if no PTY bytes for 10min during a turn, pause
+
+
 async def _autopilot_monitor(loop: AutopilotLoop) -> None:
     """Per-loop async worker: waits for the tile to settle after a response,
     judges via Llama, then either dispatches the next prompt or pauses for
-    operator review. Bails on tile death or excessive iteration count."""
+    operator review. Bails on tile death or excessive iteration count.
+
+    Pauses (not stops) on per-iteration errors so a transient judge failure
+    doesn't blow the loop. Pauses immediately when a y/n question lands on
+    the tile — the operator has to answer that before we can keep driving."""
     sess = SESSIONS.get(loop.sid)
     if sess is None:
         loop.status = "stopped"
@@ -952,6 +1165,14 @@ async def _autopilot_monitor(loop: AutopilotLoop) -> None:
                 break
             if not sess.alive:
                 loop.status = "stopped"
+                loop.last_narration = "tile died"
+                loop.updated_at = time.time()
+                break
+            # interrupt: agent is asking a y/n question — operator must answer
+            if sess.pending_question is not None:
+                loop.status = "paused"
+                loop.awaiting_decision = True
+                loop.last_narration = "agent asked a y/n question — answer it first, then resume"
                 loop.updated_at = time.time()
                 break
             if len(loop.iterations) >= AUTOPILOT_MAX_ITERATIONS:
@@ -961,6 +1182,14 @@ async def _autopilot_monitor(loop: AutopilotLoop) -> None:
                 loop.updated_at = time.time()
                 break
             if sess.status() != "idle":
+                # stuck detector: a turn with zero bytes for too long is dead
+                if sess.tracking_response and sess.last_byte_at > 0 and \
+                        time.time() - sess.last_byte_at > AUTOPILOT_STUCK_SEC:
+                    loop.status = "paused"
+                    loop.awaiting_decision = True
+                    loop.last_narration = f"tile has been silent for >{int(AUTOPILOT_STUCK_SEC/60)}min — likely stuck, review"
+                    loop.updated_at = time.time()
+                    break
                 continue
             if time.time() - sess.last_byte_at < 2.0:
                 continue
@@ -972,7 +1201,17 @@ async def _autopilot_monitor(loop: AutopilotLoop) -> None:
             buf = bytes(sess.response_buffer)
             sess.tracking_response = False
             sess.response_buffer = bytearray()
-            verdict_data = await _autopilot_judge(loop, buf)
+            try:
+                verdict_data = await _autopilot_judge(loop, buf)
+            except Exception as e:
+                # judge call blew up — pause cleanly with the error so the
+                # operator can decide whether to retry or stop.
+                loop.status = "paused"
+                loop.awaiting_decision = True
+                loop.last_narration = f"judge error: {str(e)[:140]}"
+                loop.last_verdict = "pause"
+                loop.updated_at = time.time()
+                break
             iter_n = len(loop.iterations) + 1
             loop.iterations.append({
                 "iter": iter_n,
@@ -984,7 +1223,7 @@ async def _autopilot_monitor(loop: AutopilotLoop) -> None:
                 "timestamp": time.time(),
             })
             loop.last_verdict = verdict_data["verdict"]
-            loop.last_narration = verdict_data["narration"]
+            loop.last_narration = verdict_data["narration"] or verdict_data["reasoning"]
             loop.updated_at = time.time()
             v = verdict_data["verdict"]
             if v == "done":
@@ -1000,17 +1239,28 @@ async def _autopilot_monitor(loop: AutopilotLoop) -> None:
             if not next_p:
                 loop.status = "paused"
                 loop.awaiting_decision = True
-                loop.last_narration = "judge said continue but produced no next prompt"
+                loop.last_narration = loop.last_narration or "judge said continue but produced no next prompt"
                 break
-            # forced checkpoint cadence
+            # forced checkpoint cadence — pause for review
             if loop.iters_since_checkpoint >= AUTOPILOT_CHECKPOINT_ITERS or \
                     (time.time() - loop.started_at_iter > AUTOPILOT_CHECKPOINT_SEC):
                 loop.status = "paused"
                 loop.awaiting_decision = True
                 break
             sess.enqueue(next_p)
+    except Exception as e:
+        # catch-all: never let an unhandled exception kill the monitor
+        # silently — that would leave autopilot_loop_id pinned to a dead task.
+        print(f"[autopilot] monitor crashed loop={loop.loop_id}: {e}")
+        loop.status = "paused"
+        loop.awaiting_decision = True
+        loop.last_narration = f"monitor crashed: {str(e)[:140]}"
+        loop.updated_at = time.time()
     finally:
-        if sess.autopilot_loop_id == loop.loop_id:
+        # only release the tile's autopilot binding on terminal status.
+        # On pause we keep the binding so the suggestions extractor stays
+        # disabled and resume re-attaches cleanly to the same loop.
+        if loop.status in ("done", "stopped") and sess.autopilot_loop_id == loop.loop_id:
             sess.autopilot_loop_id = None
 
 
@@ -1856,9 +2106,11 @@ async def ws_endpoint(ws: WebSocket, sid: str):
             sess.response_buffer = bytearray()
             sess.tracking_response = True
             sess.last_suggestions = None
+            sess.turn_count += 1
             _submit_to_session(sess, INITIAL_PROMPT)
 
     _ensure_drainer(sess)
+    _ensure_commit_monitor(sess)
 
     initial_task = asyncio.create_task(initial())
 
@@ -2709,7 +2961,7 @@ INDEX_HTML = r"""<!doctype html>
     min-height: 0;
   }
   .main-rail {
-    grid-template-columns: var(--rail-w, 208px) 1fr 380px;
+    grid-template-columns: var(--rail-w, 208px) 1fr var(--diff-w, 0px) 380px;
     transition: grid-template-columns .18s var(--ease);
   }
   .proj-rail {
@@ -2872,6 +3124,150 @@ INDEX_HTML = r"""<!doctype html>
 
   /* collapsed rail */
   .main-rail.rail-collapsed { --rail-w: 56px; }
+  /* live git diff column — slides in to the right of the terminals */
+  .main-rail.diff-open { --diff-w: 420px; }
+  .diff-host {
+    min-width: 0;
+    overflow: hidden;
+  }
+  .main-rail.diff-open .diff-host {
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-lg);
+    background: color-mix(in oklch, var(--n-1) 80%, transparent);
+    display: flex; flex-direction: column;
+    min-height: 0;
+  }
+
+  .topbar-toggle {
+    padding: 5px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--hairline);
+    background: transparent;
+    color: var(--muted);
+    font: 600 11px var(--font-mono);
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    transition: background .12s var(--ease), border-color .12s var(--ease), color .12s var(--ease);
+  }
+  .topbar-toggle:hover {
+    color: var(--heading);
+    border-color: var(--hairline-strong);
+  }
+  .topbar-toggle.on {
+    background: color-mix(in oklch, var(--accent) 16%, transparent);
+    border-color: color-mix(in oklch, var(--accent) 45%, transparent);
+    color: var(--heading);
+  }
+
+  /* diff panel internals */
+  .dp-shell {
+    display: flex; flex-direction: column;
+    min-height: 0;
+    height: 100%;
+  }
+  .dp-head {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--hairline);
+    background: color-mix(in oklch, var(--n-2) 40%, transparent);
+    display: flex; flex-direction: column;
+    gap: 6px;
+  }
+  .dp-head-row {
+    display: flex; align-items: center; gap: 8px;
+    font: 600 10.5px var(--font-mono);
+  }
+  .dp-title {
+    font: 700 10px var(--font-mono);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .dp-branch {
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: color-mix(in oklch, var(--accent) 14%, transparent);
+    border: 1px solid color-mix(in oklch, var(--accent) 36%, transparent);
+    color: var(--heading);
+    font-size: 10.5px;
+  }
+  .dp-branch.vibe {
+    background: color-mix(in oklch, var(--good) 14%, transparent);
+    border-color: color-mix(in oklch, var(--good) 36%, transparent);
+  }
+  .dp-status {
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    color: var(--muted);
+    font: 700 10px var(--font-mono);
+    margin-left: auto;
+  }
+  .dp-status.clean { color: var(--good); border-color: color-mix(in oklch, var(--good) 30%, transparent); }
+  .dp-status.dirty { color: var(--warn); border-color: color-mix(in oklch, var(--warn) 36%, transparent); }
+  .dp-commits {
+    max-height: 110px;
+    overflow-y: auto;
+    padding: 4px 0;
+  }
+  .dp-commit {
+    display: flex; gap: 8px; align-items: baseline;
+    padding: 3px 14px;
+    font: 500 11px var(--font-mono);
+    color: var(--muted);
+  }
+  .dp-commit .dp-sha {
+    color: var(--accent);
+    font-weight: 700;
+  }
+  .dp-commit .dp-msg {
+    color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .dp-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 6px 0 10px;
+    background: var(--n-0);
+  }
+  .dp-empty {
+    padding: 20px 14px;
+    color: var(--dim);
+    font: 500 12px var(--font-mono);
+    text-align: center;
+  }
+  .dp-line {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.45;
+    padding: 0 14px;
+    white-space: pre;
+    overflow-x: auto;
+    color: var(--text);
+  }
+  .dp-line.file {
+    color: var(--heading);
+    font-weight: 700;
+    padding-top: 8px;
+    padding-bottom: 2px;
+    background: color-mix(in oklch, var(--n-2) 60%, transparent);
+    border-top: 1px solid var(--hairline);
+  }
+  .dp-line.meta {
+    color: var(--dim);
+  }
+  .dp-line.hunk {
+    color: var(--accent);
+    background: color-mix(in oklch, var(--accent) 5%, transparent);
+  }
+  .dp-line.add { color: color-mix(in oklch, var(--good) 85%, var(--text)); background: color-mix(in oklch, var(--good) 6%, transparent); }
+  .dp-line.del { color: color-mix(in oklch, var(--bad)  78%, var(--text)); background: color-mix(in oklch, var(--bad)  6%, transparent); }
+  .dp-trunc {
+    padding: 8px 14px;
+    color: var(--warn);
+    font: 600 11px var(--font-mono);
+  }
   .rail-collapsed .proj-rail-head { padding: 10px 6px; flex-direction: column; gap: 6px; }
   .rail-collapsed .proj-rail-title { display: none; }
   .rail-collapsed .proj-min { transform: rotate(180deg); }
@@ -3015,10 +3411,10 @@ INDEX_HTML = r"""<!doctype html>
     color: var(--muted);
   }
   .compose {
-    flex: 1;
+    flex: 1 1 auto;
     display: flex; flex-direction: column;
     padding: 12px 16px 4px;
-    min-height: 0;
+    min-height: 160px;
   }
   .compose textarea {
     flex: 1;
@@ -3027,7 +3423,7 @@ INDEX_HTML = r"""<!doctype html>
     color: var(--heading);
     font: 400 13.5px/1.55 var(--font-mono);
     letter-spacing: -0.005em;
-    min-height: 0;
+    min-height: 120px;
     padding: 4px 0;
   }
   .compose textarea::placeholder { color: var(--muted); }
@@ -3051,9 +3447,10 @@ INDEX_HTML = r"""<!doctype html>
   /* ─ tasks panel (per-tile current + queue, above history) ────────── */
   .tasks {
     border-top: 1px solid var(--hairline);
-    max-height: 30%;
+    max-height: 200px;
     overflow-y: auto;
     padding: 8px 4px 6px;
+    flex: 0 0 auto;
   }
   .tasks-head {
     display: flex; align-items: center; gap: 8px;
@@ -3118,9 +3515,10 @@ INDEX_HTML = r"""<!doctype html>
 
   .history {
     border-top: 1px solid var(--hairline);
-    max-height: 30%;
+    max-height: 220px;
     overflow-y: auto;
     padding: 6px 4px 8px;
+    flex: 0 0 auto;
   }
   .history .empty {
     padding: 14px 16px;
@@ -3154,7 +3552,7 @@ INDEX_HTML = r"""<!doctype html>
     border-top: 1px solid var(--hairline);
     background: color-mix(in oklch, var(--n-2) 60%, transparent);
     padding: 10px 14px 12px;
-    max-height: 28%;
+    max-height: 220px;
     overflow-y: auto;
     font-family: var(--font-mono);
     font-size: 11.5px;
@@ -3168,6 +3566,9 @@ INDEX_HTML = r"""<!doctype html>
     display: flex; flex-direction: column;
     gap: 8px;
     font-family: var(--font-mono);
+    max-height: 280px;
+    overflow-y: auto;
+    flex: 0 0 auto;
   }
   .ap-head {
     display: flex; align-items: center; justify-content: space-between;
@@ -3550,6 +3951,9 @@ const state = {
   plans: {},             // plan_id -> { plan, projectId, ws, expanded: Set<task_id> }
   statusPoll: null,
   railCollapsed: false,
+  diffOpen: false,
+  gitState: null,        // last /api/git/<sid> snapshot for active project
+  gitPoll: null,
 };
 
 function proj() {
@@ -3836,9 +4240,10 @@ function viewWorkspace() {
         <span class="pill"><span class="led accent"></span>${escapeHtml(basename(active.folder))} · ${n} ${n === 1 ? 'agent' : 'agents'}</span>
         <span class="path" title="${escapeHtml(active.folder)}">${escapeHtml(active.folder)}</span>
         <span class="spacer"></span>
+        <button class="topbar-toggle ${state.diffOpen ? 'on' : ''}" id="diff-toggle" type="button" title="toggle live git diff panel">↳ diff</button>
         ${groqState}
       </div>
-      <div class="main main-rail ${state.railCollapsed ? 'rail-collapsed' : ''}">
+      <div class="main main-rail ${state.railCollapsed ? 'rail-collapsed' : ''} ${state.diffOpen ? 'diff-open' : ''}">
         <nav class="proj-rail" aria-label="projects">
           <div class="proj-rail-head">
             <span class="proj-rail-title">Workspaces</span>
@@ -3855,6 +4260,9 @@ function viewWorkspace() {
         </nav>
         <div class="terminals-wrap">
           ${projectStacks}
+        </div>
+        <div class="diff-host" id="diff-host">
+          ${state.diffOpen ? renderDiffPanel() : ''}
         </div>
         <aside class="sidebar" aria-label="prompt composer">
           <div class="sidebar-head">
@@ -4080,6 +4488,121 @@ function renderAutopilotPanel() {
       ${editor}
     </div>
   `;
+}
+
+/* ─ live git diff panel ─────────────────────────────────────────────── */
+
+function renderDiffPanel() {
+  const g = state.gitState;
+  if (!g) return `
+    <div class="dp-shell">
+      <div class="dp-head"><div class="dp-head-row"><span class="dp-title">git</span><span class="dp-status">loading…</span></div></div>
+      <div class="dp-body"><div class="dp-empty">fetching…</div></div>
+    </div>
+  `;
+  if (!g.is_repo) {
+    return `
+      <div class="dp-shell">
+        <div class="dp-head"><div class="dp-head-row"><span class="dp-title">git</span></div></div>
+        <div class="dp-body"><div class="dp-empty">not a git repo · run <code>git init</code> in the project folder</div></div>
+      </div>
+    `;
+  }
+  if (g.error) {
+    return `
+      <div class="dp-shell">
+        <div class="dp-head"><div class="dp-head-row"><span class="dp-title">git</span><span class="dp-status dirty">error</span></div></div>
+        <div class="dp-body"><div class="dp-empty">${escapeHtml(g.error)}</div></div>
+      </div>
+    `;
+  }
+  const branchCls = (g.branch && g.branch.startsWith('vibe/')) ? 'dp-branch vibe' : 'dp-branch';
+  const dirty = !!(g.status && g.status.length);
+  const statusCls = dirty ? 'dp-status dirty' : 'dp-status clean';
+  const statusText = dirty ? 'uncommitted' : 'clean';
+  const commitsHtml = (g.commits || []).slice().reverse().slice(0, 6).map(c => `
+    <div class="dp-commit"><span class="dp-sha">${escapeHtml(c.sha)}</span><span class="dp-msg" title="${escapeHtml(c.message)}">${escapeHtml(c.message)}</span></div>
+  `).join('');
+  const diffHtml = renderDiffLines(g.diff || '');
+  const truncated = g.diff_truncated
+    ? `<div class="dp-trunc">diff truncated · open the folder in your IDE for the full output</div>`
+    : '';
+  return `
+    <div class="dp-shell">
+      <div class="dp-head">
+        <div class="dp-head-row">
+          <span class="dp-title">git</span>
+          <span class="${branchCls}" title="current branch">${escapeHtml(g.branch || '—')}</span>
+          ${g.starting_branch && g.vibe_branch ? `<span class="dp-branch" title="started from">← ${escapeHtml(g.starting_branch)}</span>` : ''}
+          <span class="${statusCls}">${statusText}</span>
+        </div>
+        ${commitsHtml ? `<div class="dp-commits">${commitsHtml}</div>` : ''}
+      </div>
+      <div class="dp-body">
+        ${diffHtml}
+        ${truncated}
+      </div>
+    </div>
+  `;
+}
+
+function renderDiffLines(diff) {
+  if (!diff || !diff.trim()) {
+    return '<div class="dp-empty">no diff vs HEAD · working tree matches the last commit</div>';
+  }
+  const lines = diff.split('\n');
+  const out = [];
+  for (const line of lines) {
+    let cls = '';
+    if (line.startsWith('diff --git ')) cls = 'file';
+    else if (line.startsWith('--- ') || line.startsWith('+++ ') || line.startsWith('index ') || line.startsWith('new file') || line.startsWith('deleted file') || line.startsWith('rename ') || line.startsWith('similarity ')) cls = 'meta';
+    else if (line.startsWith('@@')) cls = 'hunk';
+    else if (line.startsWith('+')) cls = 'add';
+    else if (line.startsWith('-')) cls = 'del';
+    out.push(`<div class="dp-line ${cls}">${escapeHtml(line) || '&nbsp;'}</div>`);
+  }
+  return out.join('');
+}
+
+async function fetchGitState() {
+  const p = proj();
+  if (!p || !p.sessions.length) return;
+  const sid = p.sessions[0];
+  try {
+    const r = await api(`/api/git/${sid}`);
+    if (r && r.ok) state.gitState = r;
+  } catch (e) {}
+}
+
+function refreshDiffPanel() {
+  const host = document.getElementById('diff-host');
+  if (!host) return;
+  if (!state.diffOpen) { host.innerHTML = ''; return; }
+  host.innerHTML = renderDiffPanel();
+}
+
+async function toggleDiffPanel() {
+  state.diffOpen = !state.diffOpen;
+  const main = document.querySelector('.main-rail');
+  const btn = document.getElementById('diff-toggle');
+  if (main) main.classList.toggle('diff-open', state.diffOpen);
+  if (btn) btn.classList.toggle('on', state.diffOpen);
+  if (state.diffOpen) {
+    await fetchGitState();
+    refreshDiffPanel();
+    if (!state.gitPoll) {
+      state.gitPoll = setInterval(async () => {
+        if (!state.diffOpen) return;
+        await fetchGitState();
+        refreshDiffPanel();
+      }, 2000);
+    }
+  } else {
+    refreshDiffPanel();
+    if (state.gitPoll) { clearInterval(state.gitPoll); state.gitPoll = null; }
+  }
+  // xterms need refit because the terminals column width changed
+  setTimeout(() => { for (const sid in state.terms) { try { state.terms[sid].fit.fit(); } catch (e) {} } }, 220);
 }
 
 function refreshAutopilotPanel() {
@@ -4436,6 +4959,8 @@ function wire() {
     $('#send').onclick = sendPrompt;
     const ap = $('#autopilot');
     if (ap) ap.onclick = startAutopilot;
+    const dt = $('#diff-toggle');
+    if (dt) dt.onclick = toggleDiffPanel;
     const ta = $('#prompt');
     ta.addEventListener('keydown', e => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
