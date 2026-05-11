@@ -2367,6 +2367,70 @@ def _run_server_in_thread() -> tuple[uvicorn.Server, threading.Thread]:
     return server, t
 
 
+def _setup_macos_identity() -> None:
+    """Rename the Dock entry to 'vibehelp' and replace the generic Python
+    icon with the vibehelper mark, all in-memory — no PNG asset needed."""
+    if sys.platform != "darwin":
+        return
+    try:
+        from AppKit import (
+            NSApplication, NSImage, NSBezierPath, NSColor,
+        )
+        from Foundation import NSBundle, NSProcessInfo, NSRect, NSSize
+    except ImportError:
+        return
+
+    # rename: dock + menu bar + tooltip
+    try:
+        bundle = NSBundle.mainBundle()
+        info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+        if info is not None:
+            info["CFBundleName"] = "vibehelp"
+            info["CFBundleDisplayName"] = "vibehelp"
+        NSProcessInfo.processInfo().setProcessName_("vibehelp")
+    except Exception:
+        pass
+
+    # paint the icon: dark squarcle + two white bars (2nd at 42% opacity)
+    try:
+        size = 512.0
+        img = NSImage.alloc().initWithSize_(NSSize(size, size))
+        img.lockFocus()
+
+        # squarcle background #0d0d12
+        NSColor.colorWithSRGBRed_green_blue_alpha_(0.052, 0.052, 0.071, 1.0).setFill()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSRect((0.0, 0.0), (size, size)),
+            size * 0.225, size * 0.225,
+        ).fill()
+
+        # two-bar mark, centered
+        pad = size * 0.20
+        inner = size - 2 * pad
+        bar_w = inner * 0.44
+        bar_h = inner * 0.76
+        gap = inner * 0.04
+        total_w = 2 * bar_w + gap
+        left = pad + (inner - total_w) / 2.0
+        bottom = pad + (inner - bar_h) / 2.0
+        radius = bar_w * 0.18
+
+        NSColor.whiteColor().setFill()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSRect((left, bottom), (bar_w, bar_h)), radius, radius,
+        ).fill()
+
+        NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.42).setFill()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            NSRect((left + bar_w + gap, bottom), (bar_w, bar_h)), radius, radius,
+        ).fill()
+
+        img.unlockFocus()
+        NSApplication.sharedApplication().setApplicationIconImage_(img)
+    except Exception:
+        pass
+
+
 def _launch_native_window(url: str) -> bool:
     """Try to open a native macOS window via pywebview. Return False if
     the dependency is missing or initialization fails."""
@@ -2375,9 +2439,11 @@ def _launch_native_window(url: str) -> bool:
     except ImportError:
         return False
 
+    _setup_macos_identity()
+
     try:
         webview.create_window(
-            "vibehelper",
+            "vibehelp",
             url,
             width=1400, height=900,
             min_size=(1024, 700),
