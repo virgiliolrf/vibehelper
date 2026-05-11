@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local secrets / runtime state
+# (vibehelper reads ~/.config/vibehelper/config.json — never bundle it)
+config.json
+config.local.json
+*.secret
+.env
+.env.local
+
+# Build artefacts (if you ever pyinstaller it)
+build/
+dist/
+*.spec
