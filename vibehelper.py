@@ -28,6 +28,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import shutil
 import signal
 import struct
@@ -38,8 +39,9 @@ import threading
 import time
 import urllib.request
 import webbrowser
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Set
 
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -196,8 +198,22 @@ def _ensure_gemini_trust(folder: str) -> None:
 
 
 # Idle-prompt box-drawing fingerprint Claude/Gemini emit when waiting for input.
-IDLE_HINT_BYTES = "╭".encode("utf-8")
-PIPE_HINT_BYTES = "│".encode("utf-8")
+IDLE_HINT_BYTES = "╭".encode("utf-8")   # claude code input-box top-left corner
+PIPE_HINT_BYTES = "│".encode("utf-8")   # claude code input-box side
+# gemini cli draws its input box with horizontal blocks (▄ on top, ▀ on bottom)
+# — four-in-a-row is a strong signal it's the input box, not stray box-drawing.
+GEMINI_IDLE_BYTES = "▄▄▄▄".encode("utf-8")
+
+
+def _tail_looks_idle(tail: bytes) -> bool:
+    """True when the tail contains the agent's idle input-box fingerprint.
+    Handles both Claude Code (╭ + │) and Gemini CLI (▄▄▄▄) — these were the
+    two TUI styles in use; if a new agent shows up, add its fingerprint here."""
+    if IDLE_HINT_BYTES in tail and PIPE_HINT_BYTES in tail:
+        return True
+    if GEMINI_IDLE_BYTES in tail:
+        return True
+    return False
 
 
 # ── pty session ───────────────────────────────────────────────────────────────
@@ -219,6 +235,46 @@ class Session:
         self.last_prompt_at: float = 0.0
         self.output_tail: bytearray = bytearray()   # rolling last ~2KB of pty output
         self.ws: Optional[WebSocket] = None  # set by the WS endpoint while connected
+        # pending user prompts; drained one-at-a-time by _session_drainer once
+        # the agent is idle. Lets the operator queue prompts before INITIAL_PROMPT
+        # has even landed, or while a previous prompt is mid-execution.
+        self.pending_prompts: list[str] = []
+        self.drainer_task: Optional[asyncio.Task] = None
+        # in-flight CLI question (e.g. "Continue? [y/n]"). Detected from the
+        # PTY tail in api_state; llama proposes an answer asynchronously and
+        # the frontend pops a modal for the operator to accept/deny.
+        # Shape: {"text": str, "kind": "yn", "sig": str, "suggestion": "y"|"n"|None}
+        self.pending_question: Optional[dict] = None
+        self.suggestion_task: Optional[asyncio.Task] = None
+        # follow-up suggestions extracted from the agent's last response.
+        # Tracking starts when a prompt is typed (drainer/initial), the buffer
+        # captures all subsequent PTY output, and once the tile sits idle for
+        # ≥2s an async Groq call asks Llama to extract actionable items.
+        # last_suggestions shape: {"items": [{"title", "detail"}], "sig": str}
+        self.response_buffer: bytearray = bytearray()
+        self.tracking_response: bool = False
+        self.last_suggestions: Optional[dict] = None
+        self.suggestion_extract_task: Optional[asyncio.Task] = None
+        # autopilot loop id, when this tile is being driven by the self-loop.
+        # When set, the suggestions extractor stands down — the autopilot
+        # monitor owns this tile's response buffer.
+        self.autopilot_loop_id: Optional[str] = None
+
+    def is_ready_for_input(self) -> bool:
+        """True when the agent finished booting and is idle — safe to type a
+        new prompt at the cursor without it being eaten by the boot wizard."""
+        if not self.alive or self.master_fd is None:
+            return False
+        if not self.initial_sent:
+            return False
+        return self.status() == "idle"
+
+    def enqueue(self, prompt: str) -> None:
+        """Queue a prompt to be typed when the agent is ready. Newlines
+        normalised to spaces — agents submit on CR, not LF."""
+        line = " ".join(prompt.splitlines()).strip()
+        if line:
+            self.pending_prompts.append(line)
 
     def mark_output(self, data: bytes = b"") -> None:
         self.last_byte_at = time.time()
@@ -226,6 +282,12 @@ class Session:
             self.output_tail.extend(data)
             if len(self.output_tail) > 2048:
                 del self.output_tail[: len(self.output_tail) - 2048]
+            # capture the agent's full response when we're tracking one,
+            # capped so a runaway response doesn't blow memory.
+            if self.tracking_response:
+                self.response_buffer.extend(data)
+                if len(self.response_buffer) > 20480:
+                    del self.response_buffer[: len(self.response_buffer) - 20480]
 
     def status(self) -> str:
         """Heuristic state for routing + UI:
@@ -243,7 +305,7 @@ class Session:
             return "thinking"
         # idle if a recent input-box pattern is visible in the tail
         tail = bytes(self.output_tail[-1024:])
-        if IDLE_HINT_BYTES in tail and PIPE_HINT_BYTES in tail:
+        if _tail_looks_idle(tail):
             return "idle"
         # if quiet for >5s, just call it idle anyway
         if self.last_byte_at and (now - self.last_byte_at) > 5.0:
@@ -434,17 +496,80 @@ Skip any tile with status=down — it cannot receive prompts.
 
 # Output — JSON only, this exact schema
 {
-  "kind": "single" | "split" | "amend",
-  "routes": [ { "sid": "...", "prompt": "..." } ],
+  "kind": "single" | "split" | "amend" | "conduct",
+  "routes": [ { "sid": "...", "prompt": "...", "clear_context": false } ],  // for single | split | amend; OMIT or [] when conduct
+  "plan":   {                                             // ONLY when kind=conduct
+    "title": "<short feature name, ≤60 chars>",
+    "tasks": [
+      {
+        "id": "T1",                              // unique short id, "T1".."T9"
+        "title": "<short imperative, ≤80 chars>",
+        "depends_on": ["T0", ...],               // task ids that must finish first; root tasks: []
+        "tile_pref": "any" | "T<n>",             // "T<n>" = continue on the tile that ran that task (context continuity)
+        "prompt": "<persona + context + task, same shape as a regular rewritten prompt>"
+      }
+    ]
+  },
   "reasoning": "<phrase, ≤15 words>"
 }
 
-# Decision (first match wins)
+# Decision (first match wins — default to single when in doubt)
 1. **amend** — operator is correcting or redirecting work a tile is mid-task on. Triggers: "no, ...", "stop", "actually ...", "use X instead", "change to ...". Route to that ONE tile. Prompt MUST start with "Stop the current approach and instead ...".
-2. **split** — message contains N truly independent subtasks (joined by "and" / list / numbered, no shared state). One route per available tile, up to len(tiles); each tile gets a distinct subtask.
-3. **single** — everything else. Exactly ONE tile. Preference order: idle > the tile whose `last_prompt` is most semantically related to the new message (treat as a follow-up) > least-busy.
+2. **conduct** — the request is a FEATURE with REAL internal ordering: one piece must finish before others can start (e.g. "scaffold the folder structure THEN implement two modules inside it", "set up the schema THEN write the API THEN the UI"). Express it as a small DAG (2–6 tasks). Use kind=conduct ONLY when ordering is genuinely required by the work itself — if every piece is independent, use split; if the pieces are aspects of one task, use single.
+3. **split** — the message lists MULTIPLE SEPARATE DELIVERABLES, each one a distinct artifact (its own file / module / route / page / feature) that another engineer could pick up in isolation. To qualify as split, ALL of these must be true:
+   - There are ≥ 2 deliverables that produce distinct artifacts.
+   - The deliverables share no editing surface — no two routes would touch the same file or module.
+   - Each deliverable is substantial enough to be its own task, not a side-effect of another ("add tests for it", "and clean it up", "and add a comment" → NOT split).
+   Split YES: "build a landing page AND a CLI tool", "implement /signup AND /settings", "write tests for auth/ AND for payments/", "scaffold the React frontend AND the FastAPI backend".
+   Split NO (use single): "think about improvements and new functions" (one analysis), "refactor X and clean it up" (same surface), "build login with email and password" (one form), "fix the bug and add a test for it" (one fix area), "analyze the project and prepare to assist me" (one survey), "review the code and suggest changes" (one review), "add a dark mode and improve contrast" (same UI surface).
+   One route per available tile, up to len(tiles); each tile gets a distinct subtask.
+4. **single** — DEFAULT. Exactly ONE tile. Preference order: idle > the tile whose `last_prompt` is most semantically related to the new message (treat as a follow-up) > least-busy.
+
+Tiebreaker rule: if you can't clearly point to two separate deliverables touching different files/modules, choose **single**. Splitting wrongly forces two agents to step on each other; falling back to single only costs sequential time, which is recoverable.
 
 Hard constraints: never assign the same prompt to two tiles; never route to a down tile.
+
+# Conduct rules (only when kind=conduct)
+- Keep the DAG small: 2–6 tasks. Don't pad. If you can't justify the ordering, downgrade to split or single.
+- Task ids must be short and unique ("T1", "T2", ...). depends_on must reference existing ids. No cycles.
+- At least one task must have depends_on=[] (a root). Every non-root task must depend on at least one earlier task.
+- Use tile_pref="T<n>" when a task should continue on the same tile that ran T<n> (typically because that tile already has the context loaded — e.g. T2 fills in files inside the folder T1 just scaffolded on tile A, so keeping it on tile A is natural). Use "any" when the task is fresh and any free tile will do — this is what lets the conductor parallelize across tiles.
+- Each task's `prompt` must follow the PERSONA + CONTEXT + TASK structure from the rewriting rules below. The CONTEXT line of a downstream task must explicitly name the upstream task it builds on (e.g. "Building on T1, which just scaffolded src/auth/ — your work goes inside that folder.") so the agent reads the right files.
+- When kind=conduct, the top-level `routes` field MUST be empty or omitted.
+
+# Conduct example
+Input: "Build a full Auth system with JWT and Google OAuth"
+Output:
+{
+  "kind": "conduct",
+  "plan": {
+    "title": "Auth system with JWT + Google OAuth",
+    "tasks": [
+      {"id":"T1","title":"Scaffold auth folder structure","depends_on":[],"tile_pref":"any","prompt":"Act as a senior backend engineer. CONTEXT: the project currently has no auth module. TASK: Scaffold a src/auth/ package with empty stubs jwt.py, oauth_google.py, routes.py, schemas.py, and a tests/ subfolder mirroring the layout — one-line module docstrings and TODO markers only, no logic yet."},
+      {"id":"T2","title":"Implement JWT logic","depends_on":["T1"],"tile_pref":"T1","prompt":"Act as a senior Python backend engineer focused on auth. CONTEXT: Building on T1, which just scaffolded src/auth/ — fill in src/auth/jwt.py and src/auth/schemas.py (the User+Token models). TASK: Implement issue_token, verify_token, and a refresh helper using PyJWT; HS256 from a SECRET_KEY env var; 15-min access, 7-day refresh; raise typed AuthError on invalid/expired."},
+      {"id":"T3","title":"Implement Google OAuth routes","depends_on":["T1"],"tile_pref":"any","prompt":"Act as a senior Python backend engineer comfortable with OAuth2. CONTEXT: Building on T1, which scaffolded src/auth/ — fill in src/auth/oauth_google.py and src/auth/routes.py. TASK: Implement the Google OAuth2 authorization-code flow: /auth/google/login redirect, /auth/google/callback exchange via authlib, fetch the userinfo, mint a JWT via the helper in jwt.py (will be available after T2), and persist a User. Use GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET env vars."}
+    ]
+  },
+  "reasoning": "conduct — scaffold first, then JWT+OAuth in parallel"
+}
+
+# Context clearing — per-route `clear_context` decision
+For every route in `routes`, also decide `clear_context: true|false`. When true, the backend types `/clear` into the agent's REPL BEFORE the prompt, wiping the conversation history for that tile.
+
+Default is **false** — preserve context. The tile's prior conversation (including the initial project analysis) is expensive to rebuild, so only clear when keeping it would actively HARM the new task.
+
+Set `clear_context: true` ONLY when ALL of these hold:
+- The new message is on a clearly different topic / module / feature from the tile's `last_prompt`.
+- The prior conversation would actively mislead the agent (e.g. it just finished refactoring `auth.ts` and the new message is about `billing/` — references to auth.ts in the agent's memory would confuse the new work).
+- The new task does not build on, reference, or refine the prior work in any way.
+
+Set `clear_context: false` when:
+- The new message continues, refines, fixes, tests, or extends the prior work ("continue", "now add tests", "fix the bug you just introduced", follow-up questions).
+- The tile has no `last_prompt` yet (first message — nothing to clear).
+- kind=amend — amend depends on the in-flight work; clearing would destroy the very context being corrected. ALWAYS false for amend.
+- You're uncertain whether the prior context helps or hurts — default to false. Re-analyzing a project is expensive; mild confusion from stale context is recoverable.
+
+For kind=conduct, omit `clear_context` from task prompts — the conductor manages context continuity across the DAG itself.
 
 # Rewriting rules — every route's `prompt` must give the agent persona + context + task
 
@@ -473,6 +598,536 @@ def _submit_to_session(sess: "Session", prompt: str) -> None:
     # tiny pause then a CR so the TUI's debouncer registers the line first
     time.sleep(0.04)
     sess.write(b"\r")
+
+
+async def _session_drainer(sess: "Session") -> None:
+    """Per-session worker: types queued user prompts into the PTY one at a
+    time, waiting for the agent to return to idle between submissions.
+    Lets the operator type prompts while INITIAL_PROMPT is still in flight
+    or while the previous prompt is mid-execution — they land in order."""
+    while sess.alive:
+        await asyncio.sleep(0.15)
+        if not sess.pending_prompts:
+            continue
+        if not sess.is_ready_for_input():
+            continue
+        line = sess.pending_prompts[0]
+        sess.last_prompt = line
+        sess.last_prompt_at = time.time()
+        # arm response tracking for the upcoming reply — buffer is wiped,
+        # tracking flag tells mark_output to accumulate, and any stale
+        # follow-up suggestions from a previous turn are cleared so the
+        # badge doesn't dangle while the new response is still streaming.
+        # /clear is a meta-command (no useful agent response), skip tracking.
+        if line.strip() != "/clear":
+            sess.response_buffer = bytearray()
+            sess.tracking_response = True
+            sess.last_suggestions = None
+        # offload the blocking write (sleep + CR) to a thread so the loop
+        # can keep pumping bytes through other sessions' websockets.
+        await asyncio.to_thread(_submit_to_session, sess, line)
+        # only pop after the write returned, so a crash mid-write doesn't
+        # silently drop the prompt — it'll get retried on the next tick.
+        if sess.pending_prompts and sess.pending_prompts[0] is line:
+            sess.pending_prompts.pop(0)
+
+
+def _ensure_drainer(sess: "Session") -> None:
+    """Start the per-session drainer if one isn't already running. Called
+    from the ws_endpoint so the drainer lives on uvicorn's event loop."""
+    if sess.drainer_task is None or sess.drainer_task.done():
+        sess.drainer_task = asyncio.create_task(_session_drainer(sess))
+
+
+# ── CLI question detection (y/n) + llama-proposed answer ──────────────────────
+
+_YN_PATTERNS = [
+    re.compile(rb"\(y/n\)", re.IGNORECASE),
+    re.compile(rb"\[y/n\]", re.IGNORECASE),
+    re.compile(rb"\(yes/no\)", re.IGNORECASE),
+    re.compile(rb"\[yes/no\]", re.IGNORECASE),
+    re.compile(rb"\bY/n\b"),
+    re.compile(rb"\by/N\b"),
+]
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07")
+
+
+def _strip_ansi_text(b: bytes) -> str:
+    return _ANSI_RE.sub("", b.decode("utf-8", errors="replace"))
+
+
+def _detect_yn_question(sess: "Session") -> Optional[dict]:
+    """Heuristic: when an agent is sitting idle with a [y/n] in its recent
+    output, assume it just asked the operator a yes/no question. Returns
+    the visible question summary + a stable signature for dedup, or None."""
+    if not sess.alive or sess.master_fd is None or not sess.initial_sent:
+        return None
+    if sess.status() != "idle":
+        return None
+    tail = bytes(sess.output_tail[-1500:])
+    if not any(p.search(tail) for p in _YN_PATTERNS):
+        return None
+    plain = _strip_ansi_text(tail)
+    lines = [l.strip() for l in plain.splitlines() if l.strip()]
+    text = " ".join(lines[-4:])[:280] if lines else ""
+    # signature = the question text itself; new wording → new modal
+    return {"text": text, "kind": "yn", "sig": text}
+
+
+async def _fetch_yn_suggestion(sess: "Session") -> None:
+    """Ask Groq Llama for a y/n suggestion for the current pending question.
+    Stored back on sess.pending_question.suggestion so the next /api/state
+    poll surfaces it to the modal. Defaults to 'y' on any failure."""
+    q = sess.pending_question
+    if q is None or groq_client is None:
+        if q is not None:
+            q["suggestion"] = q.get("suggestion") or "y"
+        return
+    readme = _get_project_readme(sess.folder)
+    user = (
+        "A CLI coding agent is asking the operator a yes/no question inside "
+        "a project. Reply with exactly one character: y or n. No explanation, "
+        "no punctuation, just the single character.\n\n"
+        f"PROJECT README (may be empty):\n{readme[:1500]}\n\n"
+        f"QUESTION:\n{q['text']}\n\nANSWER (y or n):"
+    )
+    ans = "y"
+    try:
+        resp = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": user}],
+            max_tokens=2,
+            temperature=0,
+        )
+        raw = (resp.choices[0].message.content or "").strip().lower()
+        ans = "n" if raw.startswith("n") else "y"
+    except Exception:
+        ans = "y"
+    if sess.pending_question is not None and sess.pending_question.get("sig") == q["sig"]:
+        sess.pending_question["suggestion"] = ans
+
+
+def _update_question_state(sess: "Session") -> None:
+    """Run once per /api/state poll: refresh the pending_question slot and
+    fire a llama suggestion task if a new question just appeared."""
+    detected = _detect_yn_question(sess)
+    if detected is None:
+        sess.pending_question = None
+        return
+    cur = sess.pending_question
+    if cur is None or cur.get("sig") != detected["sig"]:
+        sess.pending_question = {**detected, "suggestion": None}
+        if sess.suggestion_task is None or sess.suggestion_task.done():
+            sess.suggestion_task = asyncio.create_task(_fetch_yn_suggestion(sess))
+
+
+# ── follow-up suggestions (extract actionable items from agent's response) ────
+
+async def _extract_suggestions(sess: "Session", buffer_bytes: bytes) -> None:
+    """Ask Groq Llama to extract actionable follow-up items from the agent's
+    last response. Stores the result on sess.last_suggestions so the next
+    /api/state poll surfaces a badge in the agents panel. Silent on failure
+    — a missing badge is better than a fake one."""
+    if groq_client is None:
+        return
+    text = _strip_ansi_text(buffer_bytes)
+    if len(text.strip()) < 200:
+        return
+    user = (
+        "An agent just produced this response inside a coding project. "
+        "If it contains a list of ACTIONABLE follow-up items the operator "
+        "could implement next (suggestions, recommendations, next steps, "
+        "improvements, TODOs, things to add/fix/wire-up), extract them.\n\n"
+        "Rules:\n"
+        "- Only items implementable as code/config changes. Skip observations, "
+        "ratings, opinions, comparisons, competitive analysis, market commentary.\n"
+        "- Keep ≤ 8 items, the most concrete ones first.\n"
+        "- `title`: imperative ≤80 chars (Build/Fix/Add/Wire-up...).\n"
+        "- `detail`: one line ≤140 chars naming files/modules/specifics from the response.\n"
+        "- If no actionable items, return {\"items\": []}.\n\n"
+        "Return STRICT JSON only:\n"
+        '{"items": [{"title": "...", "detail": "..."}]}\n\n'
+        f"RESPONSE:\n{text[:8000]}\n\nJSON:"
+    )
+    try:
+        resp = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": user}],
+            max_tokens=900,
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(resp.choices[0].message.content or "{}")
+        items = data.get("items") or []
+        items = [
+            {"title": str(it.get("title", "")).strip()[:120],
+             "detail": str(it.get("detail", "")).strip()[:200]}
+            for it in items if str(it.get("title", "")).strip()
+        ][:8]
+        if items:
+            sess.last_suggestions = {"items": items, "sig": f"{int(time.time())}-{len(items)}"}
+    except Exception:
+        return
+
+
+def _update_suggestions_state(sess: "Session") -> None:
+    """Called once per /api/state poll. When a tracked response has settled
+    (tile idle, ≥2s since last byte, buffer non-trivial), kick off the
+    Llama extraction once and disarm tracking until the next prompt.
+    Skipped entirely while autopilot is driving the tile — the autopilot
+    monitor owns the buffer and consumes it via its own judge call."""
+    if sess.autopilot_loop_id is not None:
+        return
+    if not sess.tracking_response:
+        return
+    if not sess.alive:
+        sess.tracking_response = False
+        return
+    if sess.status() != "idle":
+        return
+    if time.time() - sess.last_byte_at < 2.0:
+        return
+    buf = bytes(sess.response_buffer)
+    sess.tracking_response = False  # disarm; tracking re-arms on next prompt
+    if len(buf) < 200:
+        return
+    if sess.suggestion_extract_task is None or sess.suggestion_extract_task.done():
+        sess.suggestion_extract_task = asyncio.create_task(_extract_suggestions(sess, buf))
+
+
+# ── autopilot (self-driving loop on a single tile toward a goal) ─────────────
+#
+# The operator hands a high-level goal; Llama judges the agent's output after
+# each iteration and either continues (composes the next prompt + dispatches),
+# pauses (surfaces a checkpoint to the operator), or marks the goal done.
+# Forced checkpoint after AUTOPILOT_CHECKPOINT_ITERS iterations OR
+# AUTOPILOT_CHECKPOINT_SEC seconds so a runaway loop can't burn the project.
+
+AUTOPILOT_CHECKPOINT_ITERS = 3
+AUTOPILOT_CHECKPOINT_SEC = 300.0
+AUTOPILOT_MAX_ITERATIONS = 15
+
+AUTOPILOT_JUDGE_SYSTEM = """# Persona
+You are vibehelper's autopilot judge. You drive a coding agent (Claude Code / Gemini CLI) toward a production-grade goal the operator gave you. After each agent response you read the response, decide if the work is done / needs more / should pause, and (when more is needed) compose the next prompt for the agent.
+
+# Input
+{
+  "goal": str,
+  "iteration_number": int,
+  "last_response": str,                      // last ≤6KB of the agent's output (ANSI stripped)
+  "history": [{"iter", "verdict", "narration"}]  // up to 5 most-recent iterations
+}
+
+# Output — JSON only, this exact schema
+{
+  "verdict": "continue" | "pause" | "done",
+  "reasoning": "<≤30 words: why this verdict>",
+  "narration": "<≤25 words: what just happened, plain English for the operator>",
+  "next_prompt": "<persona + context + task; ONLY when verdict=continue>"
+}
+
+# Verdict rules
+- **done** — goal is fully achieved. Response includes the deliverable AND evidence of validation (tests passing, code shipped, no open caveats, no "next step" left to take). When in doubt, prefer pause.
+- **pause** — surface to the operator when ANY of these hold:
+  - Agent is asking the operator a question.
+  - Agent stalled, looped, contradicted itself, or introduced a regression vs. the last iteration.
+  - Response says "let me know how to proceed" / "should I continue" / equivalent.
+  - You can't tell what state the work is in.
+- **continue** — there is a clear, concrete next step that advances the goal. Compose `next_prompt`.
+
+# next_prompt rules (verdict=continue only)
+- PERSONA + CONTEXT + TASK shape, one tight paragraph.
+- CONTEXT must reference specific files/modules/functions from `last_response` so the agent re-opens them.
+- TASK is ONE focused next step (don't pile up). Imperative voice (Build / Fix / Wire up / Refactor / Add tests / Validate / Implement).
+- Never ask meta questions back to the agent ("are you sure?"). Give it work.
+- ≤ 4 sentences total.
+
+# narration rules
+- Plain English to the operator, past tense, no file paths or code.
+- Example: "Wired VRF arbiter selection; tests still pending." not "Modified arbiter.py and added test_arbiter.py."
+
+# reasoning rules
+- One short phrase. Why this verdict. Reference the iteration history if useful.
+"""
+
+
+@dataclass
+class AutopilotLoop:
+    loop_id: str
+    sid: str
+    folder: str
+    goal: str
+    status: str = "running"            # running | paused | done | stopped
+    iterations: List[dict] = field(default_factory=list)
+    last_verdict: str = ""
+    last_narration: str = ""
+    awaiting_decision: bool = False
+    iters_since_checkpoint: int = 0
+    started_at: float = 0.0
+    started_at_iter: float = 0.0
+    updated_at: float = 0.0
+    monitor_task: Optional[asyncio.Task] = None
+
+
+AUTOPILOTS: Dict[str, AutopilotLoop] = {}
+
+
+def _autopilot_snapshot(loop: AutopilotLoop) -> dict:
+    return {
+        "loop_id": loop.loop_id,
+        "sid": loop.sid,
+        "goal": loop.goal,
+        "status": loop.status,
+        "iterations_count": len(loop.iterations),
+        "iters_since_checkpoint": loop.iters_since_checkpoint,
+        "last_verdict": loop.last_verdict,
+        "last_narration": loop.last_narration,
+        "awaiting_decision": loop.awaiting_decision,
+        "iterations": loop.iterations[-10:],
+        "updated_at": loop.updated_at,
+    }
+
+
+async def _autopilot_judge(loop: AutopilotLoop, response_bytes: bytes) -> dict:
+    """Ask Groq Llama: continue / pause / done, and (if continue) the next
+    prompt. Defensive defaults on any failure so the loop can pause cleanly
+    rather than dispatch garbage."""
+    if groq_client is None:
+        return {"verdict": "pause", "reasoning": "groq unavailable", "narration": "groq offline"}
+    response = _strip_ansi_text(response_bytes)
+    if len(response) > 6000:
+        response = response[-6000:]
+    history = [
+        {"iter": it.get("iter", 0), "verdict": it.get("verdict", ""), "narration": it.get("narration", "")}
+        for it in loop.iterations[-5:]
+    ]
+    payload = json.dumps({
+        "goal": loop.goal,
+        "iteration_number": len(loop.iterations) + 1,
+        "last_response": response,
+        "history": history,
+    }, ensure_ascii=False)
+    try:
+        resp = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": AUTOPILOT_JUDGE_SYSTEM},
+                {"role": "user", "content": payload},
+            ],
+            max_tokens=900,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(resp.choices[0].message.content or "{}")
+        verdict = data.get("verdict", "pause")
+        if verdict not in ("continue", "pause", "done"):
+            verdict = "pause"
+        return {
+            "verdict": verdict,
+            "reasoning": str(data.get("reasoning", ""))[:300],
+            "narration": str(data.get("narration", ""))[:240],
+            "next_prompt": str(data.get("next_prompt", ""))[:1500] if verdict == "continue" else "",
+        }
+    except Exception as e:
+        return {"verdict": "pause", "reasoning": f"judge error: {e}", "narration": "judge call failed"}
+
+
+async def _autopilot_monitor(loop: AutopilotLoop) -> None:
+    """Per-loop async worker: waits for the tile to settle after a response,
+    judges via Llama, then either dispatches the next prompt or pauses for
+    operator review. Bails on tile death or excessive iteration count."""
+    sess = SESSIONS.get(loop.sid)
+    if sess is None:
+        loop.status = "stopped"
+        loop.updated_at = time.time()
+        return
+    sess.autopilot_loop_id = loop.loop_id
+    try:
+        while True:
+            await asyncio.sleep(0.5)
+            if loop.status != "running":
+                break
+            if not sess.alive:
+                loop.status = "stopped"
+                loop.updated_at = time.time()
+                break
+            if len(loop.iterations) >= AUTOPILOT_MAX_ITERATIONS:
+                loop.status = "paused"
+                loop.awaiting_decision = True
+                loop.last_narration = "hit max iterations cap — review and resume to continue"
+                loop.updated_at = time.time()
+                break
+            if sess.status() != "idle":
+                continue
+            if time.time() - sess.last_byte_at < 2.0:
+                continue
+            if not sess.tracking_response:
+                continue
+            if len(sess.response_buffer) < 50:
+                sess.tracking_response = False
+                continue
+            buf = bytes(sess.response_buffer)
+            sess.tracking_response = False
+            sess.response_buffer = bytearray()
+            verdict_data = await _autopilot_judge(loop, buf)
+            iter_n = len(loop.iterations) + 1
+            loop.iterations.append({
+                "iter": iter_n,
+                "response_excerpt": _strip_ansi_text(buf)[-2000:],
+                "verdict": verdict_data["verdict"],
+                "reasoning": verdict_data["reasoning"],
+                "narration": verdict_data["narration"],
+                "next_prompt": verdict_data["next_prompt"],
+                "timestamp": time.time(),
+            })
+            loop.last_verdict = verdict_data["verdict"]
+            loop.last_narration = verdict_data["narration"]
+            loop.updated_at = time.time()
+            v = verdict_data["verdict"]
+            if v == "done":
+                loop.status = "done"
+                break
+            if v == "pause":
+                loop.status = "paused"
+                loop.awaiting_decision = True
+                break
+            # continue
+            loop.iters_since_checkpoint += 1
+            next_p = verdict_data["next_prompt"].strip()
+            if not next_p:
+                loop.status = "paused"
+                loop.awaiting_decision = True
+                loop.last_narration = "judge said continue but produced no next prompt"
+                break
+            # forced checkpoint cadence
+            if loop.iters_since_checkpoint >= AUTOPILOT_CHECKPOINT_ITERS or \
+                    (time.time() - loop.started_at_iter > AUTOPILOT_CHECKPOINT_SEC):
+                loop.status = "paused"
+                loop.awaiting_decision = True
+                break
+            sess.enqueue(next_p)
+    finally:
+        if sess.autopilot_loop_id == loop.loop_id:
+            sess.autopilot_loop_id = None
+
+
+class AutopilotStartReq(BaseModel):
+    sid: str
+    goal: str
+
+
+class AutopilotResumeReq(BaseModel):
+    next_prompt: Optional[str] = None
+
+
+@app.post("/api/autopilot/start")
+async def api_autopilot_start(req: AutopilotStartReq):
+    sess = SESSIONS.get(req.sid)
+    if sess is None or not sess.alive:
+        return JSONResponse({"ok": False, "error": "unknown or dead tile"}, status_code=404)
+    if sess.autopilot_loop_id is not None:
+        return JSONResponse({"ok": False, "error": "tile already in autopilot"}, status_code=409)
+    goal = (req.goal or "").strip()
+    if not goal:
+        return JSONResponse({"ok": False, "error": "empty goal"}, status_code=400)
+    loop_id = f"L{int(time.time()*1000)%1000000:06d}"
+    loop = AutopilotLoop(
+        loop_id=loop_id,
+        sid=req.sid,
+        folder=sess.folder,
+        goal=goal,
+        status="running",
+        started_at=time.time(),
+        started_at_iter=time.time(),
+        updated_at=time.time(),
+    )
+    AUTOPILOTS[loop_id] = loop
+    sess.autopilot_loop_id = loop_id
+    sess.enqueue(goal)
+    loop.iterations.append({
+        "iter": 0,
+        "response_excerpt": "",
+        "verdict": "boot",
+        "reasoning": "first dispatch — goal sent to tile",
+        "narration": f"Dispatched goal · {goal[:120]}",
+        "next_prompt": "",
+        "timestamp": time.time(),
+    })
+    loop.last_verdict = "boot"
+    loop.last_narration = f"Dispatched goal · {goal[:120]}"
+    loop.monitor_task = asyncio.create_task(_autopilot_monitor(loop))
+    return {"ok": True, "loop": _autopilot_snapshot(loop)}
+
+
+@app.post("/api/autopilot/{loop_id}/stop")
+async def api_autopilot_stop(loop_id: str):
+    loop = AUTOPILOTS.get(loop_id)
+    if loop is None:
+        return JSONResponse({"ok": False, "error": "unknown loop"}, status_code=404)
+    loop.status = "stopped"
+    loop.updated_at = time.time()
+    sess = SESSIONS.get(loop.sid)
+    if sess is not None and sess.autopilot_loop_id == loop_id:
+        sess.autopilot_loop_id = None
+    return {"ok": True, "loop": _autopilot_snapshot(loop)}
+
+
+@app.post("/api/autopilot/{loop_id}/resume")
+async def api_autopilot_resume(loop_id: str, req: AutopilotResumeReq):
+    loop = AUTOPILOTS.get(loop_id)
+    if loop is None or loop.status != "paused":
+        return JSONResponse({"ok": False, "error": "loop not paused"}, status_code=400)
+    sess = SESSIONS.get(loop.sid)
+    if sess is None or not sess.alive:
+        return JSONResponse({"ok": False, "error": "tile gone"}, status_code=404)
+    override = (req.next_prompt or "").strip()
+    next_p = override if override else (loop.iterations[-1].get("next_prompt", "").strip() if loop.iterations else "")
+    if not next_p:
+        return JSONResponse({"ok": False, "error": "no next prompt to resume with"}, status_code=400)
+    loop.status = "running"
+    loop.awaiting_decision = False
+    loop.iters_since_checkpoint = 0
+    loop.started_at_iter = time.time()
+    loop.updated_at = time.time()
+    sess.autopilot_loop_id = loop_id
+    sess.enqueue(next_p)
+    if loop.monitor_task is None or loop.monitor_task.done():
+        loop.monitor_task = asyncio.create_task(_autopilot_monitor(loop))
+    return {"ok": True, "loop": _autopilot_snapshot(loop)}
+
+
+@app.get("/api/autopilot/{loop_id}")
+async def api_autopilot_get(loop_id: str):
+    loop = AUTOPILOTS.get(loop_id)
+    if loop is None:
+        return JSONResponse({"ok": False, "error": "unknown loop"}, status_code=404)
+    return {"ok": True, "loop": _autopilot_snapshot(loop)}
+
+
+class AnswerReq(BaseModel):
+    answer: str  # the character/string to type (e.g. "y" or "n")
+
+
+@app.post("/api/answer/{sid}")
+async def api_answer(sid: str, req: AnswerReq):
+    """Type the operator's accepted answer for a pending y/n question into
+    the agent's PTY. Used by the question modal — does NOT go through the
+    drainer queue because it's answering a live prompt at the cursor."""
+    sess = SESSIONS.get(sid)
+    if sess is None or not sess.alive or sess.master_fd is None:
+        return JSONResponse({"ok": False, "error": "no session"}, status_code=404)
+    line = (req.answer or "").strip()
+    if not line:
+        return {"ok": False, "error": "empty answer"}
+    sess.write(line.encode("utf-8"))
+    await asyncio.sleep(0.04)
+    sess.write(b"\r")
+    # clear the pending question; the next poll will re-detect if needed
+    sess.pending_question = None
+    return {"ok": True}
 
 
 class RouteReq(BaseModel):
@@ -524,12 +1179,383 @@ def _build_tile_snapshot(sids: Optional[list[str]] = None) -> list[dict]:
     return out
 
 
+# ── conductor (multi-step task DAG) ───────────────────────────────────────────
+#
+# When the router emits kind=conduct, the prompt becomes a DAG of sub-tasks
+# instead of a single dispatch. A Conductor owns one plan: it walks the graph,
+# dispatches a task to a tile when its dependencies have completed, and watches
+# the tile's PTY for "task complete" — defined as a stable idle prompt for
+# CONDUCT_IDLE_STABILITY seconds after the prompt was sent. Tool-call gaps in
+# Claude / Gemini can run a couple of seconds, so the stability window is
+# generous; the alternative (asking the agent to emit a sentinel) is unreliable
+# because the agent doesn't know it's being orchestrated.
+
+CONDUCT_IDLE_STABILITY = 6.0     # consecutive idle seconds that count as "task complete"
+CONDUCT_TASK_TIMEOUT   = 15 * 60 # ceiling per task; longer than realistic feature work
+CONDUCT_TICK           = 0.4     # scheduler loop period
+
+
+@dataclass
+class ConductorTask:
+    id: str
+    title: str
+    depends_on: List[str]
+    tile_pref: str = "any"           # "any" | "<task_id>" (continue on the tile that ran task_id)
+    prompt: str = ""
+    status: str = "pending"          # pending | ready | running | done | failed | skipped | blocked
+    sid: Optional[str] = None
+    started_at: float = 0.0
+    ended_at: float = 0.0
+    note: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "depends_on": list(self.depends_on),
+            "tile_pref": self.tile_pref,
+            "prompt": self.prompt,
+            "status": self.status,
+            "sid": self.sid,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "note": self.note,
+        }
+
+
+class Conductor:
+    """Schedules and supervises a DAG of sub-tasks across a fixed set of tiles."""
+
+    def __init__(
+        self,
+        plan_id: str,
+        title: str,
+        reasoning: str,
+        tasks: List[ConductorTask],
+        sids: List[str],
+        raw_prompt: str = "",
+    ) -> None:
+        self.plan_id = plan_id
+        self.title = title
+        self.reasoning = reasoning
+        self.raw_prompt = raw_prompt
+        self.tasks: Dict[str, ConductorTask] = {t.id: t for t in tasks}
+        self.task_order: List[str] = [t.id for t in tasks]
+        self.sids: List[str] = list(sids)
+        self.busy_sids: Set[str] = set()
+        self.created_at = time.time()
+        self.ended_at = 0.0
+        self.cancelled = False
+        self.completed = False
+        self._listeners: Set[asyncio.Queue] = set()
+        self._scheduler_task: Optional[asyncio.Task] = None
+        self._watchers: Dict[str, asyncio.Task] = {}
+
+    # ── lifecycle ────────────────────────────────────────────────────────────
+    def start(self) -> None:
+        self._scheduler_task = asyncio.create_task(self._run())
+
+    def cancel(self) -> None:
+        if self.completed or self.cancelled:
+            return
+        self.cancelled = True
+        self.ended_at = time.time()
+        for t in self.tasks.values():
+            if t.status in ("pending", "ready"):
+                t.status = "skipped"
+                t.note = "plan cancelled"
+                t.ended_at = self.ended_at
+                self._emit({"type": "task_update", "task": t.to_dict()})
+        self._emit({"type": "plan_done", "ok": False, "cancelled": True, "snapshot": self.snapshot()})
+
+    def skip(self, task_id: str) -> bool:
+        t = self.tasks.get(task_id)
+        if t is None or t.status not in ("pending", "ready", "blocked"):
+            return False
+        t.status = "skipped"
+        t.note = "manually skipped"
+        t.ended_at = time.time()
+        self._emit({"type": "task_update", "task": t.to_dict()})
+        return True
+
+    # ── state ────────────────────────────────────────────────────────────────
+    def snapshot(self) -> dict:
+        return {
+            "plan_id": self.plan_id,
+            "title": self.title,
+            "reasoning": self.reasoning,
+            "raw_prompt": self.raw_prompt,
+            "sids": list(self.sids),
+            "tasks": [self.tasks[tid].to_dict() for tid in self.task_order],
+            "completed": self.completed,
+            "cancelled": self.cancelled,
+            "created_at": self.created_at,
+            "ended_at": self.ended_at,
+        }
+
+    # ── pub/sub ──────────────────────────────────────────────────────────────
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=200)
+        self._listeners.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._listeners.discard(q)
+
+    def _emit(self, event: dict) -> None:
+        dead: list[asyncio.Queue] = []
+        for q in self._listeners:
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                dead.append(q)
+        for q in dead:
+            self._listeners.discard(q)
+
+    # ── scheduling ───────────────────────────────────────────────────────────
+    async def _run(self) -> None:
+        try:
+            while not self.cancelled:
+                self._promote_ready()
+                self._dispatch_ready()
+                if all(t.status in ("done", "failed", "skipped", "blocked")
+                       for t in self.tasks.values()):
+                    self.completed = True
+                    self.ended_at = time.time()
+                    ok = all(t.status == "done" for t in self.tasks.values())
+                    self._emit({
+                        "type": "plan_done",
+                        "ok": ok,
+                        "cancelled": False,
+                        "snapshot": self.snapshot(),
+                    })
+                    return
+                await asyncio.sleep(CONDUCT_TICK)
+        except asyncio.CancelledError:
+            pass
+
+    def _promote_ready(self) -> None:
+        for t in self.tasks.values():
+            if t.status != "pending":
+                continue
+            deps = [self.tasks[d] for d in t.depends_on if d in self.tasks]
+            if any(d.status in ("failed", "skipped", "blocked") for d in deps):
+                t.status = "blocked"
+                t.note = "upstream failed or skipped"
+                t.ended_at = time.time()
+                self._emit({"type": "task_update", "task": t.to_dict()})
+                continue
+            if all(d.status == "done" for d in deps):
+                t.status = "ready"
+                self._emit({"type": "task_update", "task": t.to_dict()})
+
+    def _dispatch_ready(self) -> None:
+        for t in self.tasks.values():
+            if t.status != "ready":
+                continue
+            sid = self._pick_sid(t)
+            if sid is None:
+                continue
+            self._dispatch(t, sid)
+
+    def _pick_sid(self, t: ConductorTask) -> Optional[str]:
+        # honour tile_pref when it names a sibling task — keep work that
+        # builds on T1's filesystem changes on the same tile that ran T1,
+        # so the agent's scrollback / context is colocated.
+        if t.tile_pref and t.tile_pref != "any":
+            pref = self.tasks.get(t.tile_pref)
+            if pref and pref.sid:
+                if pref.sid in self.busy_sids:
+                    return None  # wait for the preferred tile to free up
+                if self._sid_alive(pref.sid):
+                    return pref.sid
+        # otherwise: any free, alive tile from the project pool — idle first
+        idle_pool: list[str] = []
+        other_pool: list[str] = []
+        for sid in self.sids:
+            if sid in self.busy_sids or not self._sid_alive(sid):
+                continue
+            sess = SESSIONS.get(sid)
+            if sess is None:
+                continue
+            if sess.status() == "idle":
+                idle_pool.append(sid)
+            else:
+                other_pool.append(sid)
+        if idle_pool:
+            return idle_pool[0]
+        if other_pool:
+            return other_pool[0]
+        return None
+
+    def _sid_alive(self, sid: str) -> bool:
+        sess = SESSIONS.get(sid)
+        return sess is not None and sess.alive and sess.master_fd is not None
+
+    def _dispatch(self, t: ConductorTask, sid: str) -> None:
+        sess = SESSIONS.get(sid)
+        if sess is None:
+            return
+        t.status = "running"
+        t.sid = sid
+        t.started_at = time.time()
+        self.busy_sids.add(sid)
+        _submit_to_session(sess, t.prompt)
+        sess.last_prompt = t.prompt
+        sess.last_prompt_at = t.started_at
+        self._emit({"type": "task_update", "task": t.to_dict()})
+        self._watchers[t.id] = asyncio.create_task(self._watch(t))
+
+    async def _watch(self, t: ConductorTask) -> None:
+        """Poll the tile until it has been idle for CONDUCT_IDLE_STABILITY
+        seconds, or until the per-task timeout fires."""
+        sid = t.sid or ""
+        sess = SESSIONS.get(sid)
+        if sess is None:
+            self._finish(t, "failed", "session vanished")
+            return
+
+        deadline = t.started_at + CONDUCT_TASK_TIMEOUT
+        saw_work = False
+        idle_since = 0.0
+        try:
+            while not self.cancelled:
+                if time.time() >= deadline:
+                    self._finish(t, "failed", "timed out")
+                    return
+                if not self._sid_alive(sid):
+                    self._finish(t, "failed", "tile died")
+                    return
+                # phase 1: wait for the prompt to have been visibly accepted
+                if not saw_work:
+                    if sess.last_byte_at > t.started_at + 0.2 or sess.status() in ("thinking", "working"):
+                        saw_work = True
+                    await asyncio.sleep(0.25)
+                    continue
+                # phase 2: wait for sustained idle
+                st = sess.status()
+                if st == "idle":
+                    if idle_since == 0.0:
+                        idle_since = time.time()
+                    elif time.time() - idle_since >= CONDUCT_IDLE_STABILITY:
+                        self._finish(t, "done", "")
+                        return
+                else:
+                    idle_since = 0.0
+                await asyncio.sleep(0.35)
+            # cancelled mid-flight: leave the task as running; the cancel()
+            # path is responsible for marking pending/ready, and a running
+            # task may still finish naturally — we just stop watching.
+        except asyncio.CancelledError:
+            pass
+
+    def _finish(self, t: ConductorTask, status: str, note: str) -> None:
+        t.status = status
+        t.note = note
+        t.ended_at = time.time()
+        self.busy_sids.discard(t.sid or "")
+        self._emit({"type": "task_update", "task": t.to_dict()})
+
+
+CONDUCTORS: Dict[str, Conductor] = {}
+
+
+def _build_conductor_plan(raw_decision: dict, raw_prompt: str, sids: List[str]) -> Optional[Conductor]:
+    """Validate a router-emitted conduct plan and return a ready Conductor,
+    or None if the plan is empty / malformed. We accept partial garbage
+    (skip tasks without id or prompt) but require at least one valid task."""
+    plan = raw_decision.get("plan") or {}
+    raw_tasks = plan.get("tasks") or []
+    if not isinstance(raw_tasks, list):
+        return None
+
+    clean: list[ConductorTask] = []
+    seen: set[str] = set()
+    for rt in raw_tasks:
+        if not isinstance(rt, dict):
+            continue
+        tid = str(rt.get("id") or "").strip()
+        prompt_text = str(rt.get("prompt") or "").strip()
+        if not tid or tid in seen or not prompt_text:
+            continue
+        seen.add(tid)
+        deps = rt.get("depends_on") or []
+        if not isinstance(deps, list):
+            deps = []
+        deps = [str(d).strip() for d in deps if isinstance(d, (str, int))]
+        tile_pref = rt.get("tile_pref")
+        tile_pref = tile_pref if isinstance(tile_pref, str) and tile_pref else "any"
+        title = str(rt.get("title") or tid)[:120]
+        clean.append(ConductorTask(
+            id=tid, title=title, depends_on=deps,
+            tile_pref=tile_pref, prompt=prompt_text,
+        ))
+
+    if not clean:
+        return None
+
+    # filter deps to known ids only and break self-loops
+    for ct in clean:
+        ct.depends_on = [d for d in ct.depends_on if d in seen and d != ct.id]
+
+    # detect cycles via topological sort; if a cycle is found, drop the back-edges
+    indeg = {ct.id: 0 for ct in clean}
+    for ct in clean:
+        for d in ct.depends_on:
+            indeg[ct.id] = indeg.get(ct.id, 0) + 1
+    queue = [tid for tid, n in indeg.items() if n == 0]
+    visited: set[str] = set()
+    while queue:
+        tid = queue.pop()
+        if tid in visited:
+            continue
+        visited.add(tid)
+        for ct in clean:
+            if tid in ct.depends_on:
+                indeg[ct.id] -= 1
+                if indeg[ct.id] == 0:
+                    queue.append(ct.id)
+    cyclic = [tid for tid in indeg if tid not in visited]
+    if cyclic:
+        # break cycles by clearing deps on the cyclic tasks; better to run them
+        # too early than to deadlock the scheduler forever.
+        for ct in clean:
+            if ct.id in cyclic:
+                ct.depends_on = []
+
+    plan_id = f"p{int(time.time()*1000) % 100_000_000}"
+    title = str(plan.get("title") or raw_prompt)[:120]
+    reasoning = str(raw_decision.get("reasoning") or "")[:300]
+    return Conductor(
+        plan_id=plan_id,
+        title=title,
+        reasoning=reasoning,
+        tasks=clean,
+        sids=sids,
+        raw_prompt=raw_prompt,
+    )
+
+
 @app.get("/api/state")
 async def api_state():
-    """Lightweight poll endpoint: per-session status for the UI to redraw LEDs."""
+    """Lightweight poll endpoint: per-session status for the UI to redraw
+    LEDs, the tasks panel (current prompt + queued count), and the y/n
+    question modal when an agent sits idle on a [y/n] prompt."""
     out = {}
     for s in SESSIONS.values():
-        out[s.sid] = {"agent": s.agent, "status": s.status(), "alive": s.alive}
+        _update_question_state(s)
+        _update_suggestions_state(s)
+        ap = AUTOPILOTS.get(s.autopilot_loop_id) if s.autopilot_loop_id else None
+        out[s.sid] = {
+            "agent": s.agent,
+            "status": s.status(),
+            "alive": s.alive,
+            "current": (s.last_prompt or "")[:200],
+            "queued": len(s.pending_prompts),
+            "question": s.pending_question,
+            "suggestions": s.last_suggestions,
+            "autopilot": _autopilot_snapshot(ap) if ap is not None else None,
+        }
     return {"sessions": out}
 
 
@@ -575,6 +1601,26 @@ async def api_route(req: RouteReq):
         except Exception as e:
             error = f"router failed: {e}"
 
+    # conduct kind branches off into the Conductor: build a plan, start the
+    # scheduler, and return the plan_id so the frontend can subscribe to events.
+    if decision.get("kind") == "conduct":
+        cond = _build_conductor_plan(decision, raw, [t["sid"] for t in tiles])
+        if cond is not None:
+            CONDUCTORS[cond.plan_id] = cond
+            cond.start()
+            return {
+                "ok": True,
+                "kind": "conduct",
+                "reasoning": cond.reasoning,
+                "plan_id": cond.plan_id,
+                "plan": cond.snapshot(),
+                "routes": [],
+                "error": error,
+            }
+        # malformed conduct plan → demote to single, fall through
+        if not error:
+            error = "router returned an empty conduct plan; falling back to single dispatch"
+
     # validate + fall back
     routes = []
     valid_sids = {t["sid"] for t in tiles}
@@ -582,7 +1628,11 @@ async def api_route(req: RouteReq):
         sid = r.get("sid")
         prompt_text = (r.get("prompt") or "").strip()
         if sid in valid_sids and prompt_text:
-            routes.append({"sid": sid, "prompt": prompt_text})
+            routes.append({
+                "sid": sid,
+                "prompt": prompt_text,
+                "clear_context": bool(r.get("clear_context")),
+            })
 
     if not routes:
         # fallback: send raw to the most-idle tile (status idle > booting > working)
@@ -592,15 +1642,19 @@ async def api_route(req: RouteReq):
         if not error:
             error = "no usable routes from router; falling back to single dispatch"
 
-    # dispatch
-    now = time.time()
+    # dispatch — go through the per-session queue so prompts land in order
+    # even if the tile is still booting or mid-task. The drainer types them
+    # one-by-one once the agent is back to idle.
+    # If the router asked for a context wipe (the new prompt is on a clearly
+    # different topic from the tile's last_prompt), queue `/clear` first so
+    # the agent starts the new task fresh.
     for r in routes:
         sess = SESSIONS.get(r["sid"])
-        if sess is None or not sess.alive or sess.master_fd is None:
+        if sess is None or not sess.alive:
             continue
-        _submit_to_session(sess, r["prompt"])
-        sess.last_prompt = r["prompt"]
-        sess.last_prompt_at = now
+        if r.get("clear_context"):
+            sess.enqueue("/clear")
+        sess.enqueue(r["prompt"])
 
     return {
         "ok": True,
@@ -609,6 +1663,75 @@ async def api_route(req: RouteReq):
         "routes": routes,
         "error": error,
     }
+
+
+# ── conductor endpoints ───────────────────────────────────────────────────────
+
+@app.get("/api/conductor/{plan_id}")
+async def api_conductor_get(plan_id: str):
+    cond = CONDUCTORS.get(plan_id)
+    if cond is None:
+        return JSONResponse({"ok": False, "error": "unknown plan"}, status_code=404)
+    return {"ok": True, "plan": cond.snapshot()}
+
+
+@app.post("/api/conductor/{plan_id}/cancel")
+async def api_conductor_cancel(plan_id: str):
+    cond = CONDUCTORS.get(plan_id)
+    if cond is None:
+        return JSONResponse({"ok": False, "error": "unknown plan"}, status_code=404)
+    cond.cancel()
+    return {"ok": True, "plan": cond.snapshot()}
+
+
+@app.post("/api/conductor/{plan_id}/skip/{task_id}")
+async def api_conductor_skip(plan_id: str, task_id: str):
+    cond = CONDUCTORS.get(plan_id)
+    if cond is None:
+        return JSONResponse({"ok": False, "error": "unknown plan"}, status_code=404)
+    ok = cond.skip(task_id)
+    return {"ok": ok, "plan": cond.snapshot()}
+
+
+@app.websocket("/ws/conductor/{plan_id}")
+async def ws_conductor(ws: WebSocket, plan_id: str):
+    await ws.accept()
+    cond = CONDUCTORS.get(plan_id)
+    if cond is None:
+        try:
+            await ws.send_json({"type": "error", "error": "unknown plan"})
+        except Exception:
+            pass
+        await ws.close(code=4404)
+        return
+    q = cond.subscribe()
+    try:
+        await ws.send_json({"type": "plan", "snapshot": cond.snapshot()})
+        # if the plan is already done by the time the client connects, flush
+        # one final done event so the UI settles without waiting forever.
+        if cond.completed or cond.cancelled:
+            await ws.send_json({
+                "type": "plan_done",
+                "ok": cond.completed and not cond.cancelled,
+                "cancelled": cond.cancelled,
+                "snapshot": cond.snapshot(),
+            })
+            return
+        while True:
+            event = await q.get()
+            await ws.send_json(event)
+            if event.get("type") == "plan_done":
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        cond.unsubscribe(q)
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
 
 @app.delete("/api/session/{sid}")
@@ -712,22 +1835,30 @@ async def ws_endpoint(ws: WebSocket, sid: str):
 
     async def initial():
         # Wait until the agent has finished booting and drawn its idle
-        # input box (╭ ... │ ...) before typing — a flat sleep was racing
-        # Gemini's slower cold start and the prompt vanished into the void.
-        # Cap at 30s so a broken agent doesn't block forever.
+        # input box (╭ ... │ ...) before typing. Polled at 50ms, no breath
+        # after detection — every ms shaved off shortens the gap before
+        # queued user prompts start firing. Cap at 30s for broken agents.
         deadline = time.time() + 30.0
         while time.time() < deadline:
             if not sess.alive or sess.initial_sent:
                 return
             tail = bytes(sess.output_tail[-1024:])
-            if IDLE_HINT_BYTES in tail and PIPE_HINT_BYTES in tail:
-                # one more breath so the prompt is fully painted before typing
-                await asyncio.sleep(0.25)
+            if _tail_looks_idle(tail):
                 break
-            await asyncio.sleep(0.12)
+            await asyncio.sleep(0.05)
         if sess.alive and not sess.initial_sent:
             sess.initial_sent = True
+            sess.last_prompt = INITIAL_PROMPT
+            sess.last_prompt_at = time.time()
+            # arm response tracking — the boot analysis itself often
+            # contains "what would you like to do" follow-up handles
+            # the operator may want to act on.
+            sess.response_buffer = bytearray()
+            sess.tracking_response = True
+            sess.last_suggestions = None
             _submit_to_session(sess, INITIAL_PROMPT)
+
+    _ensure_drainer(sess)
 
     initial_task = asyncio.create_task(initial())
 
@@ -965,6 +2096,253 @@ INDEX_HTML = r"""<!doctype html>
     padding: 8px 0 0;
     place-items: stretch;
   }
+
+  /* ─ y/n question modal (when an agent asks something interactively) ── */
+  .q-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.42);
+    display: grid;
+    place-items: center;
+    padding: 48px 24px;
+    z-index: 1200;
+    animation: modalFadeIn .14s var(--ease);
+  }
+  .q-shell {
+    position: relative;
+    background: var(--n-1);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--r-xl);
+    box-shadow: var(--shadow-2);
+    max-width: 540px;
+    width: 100%;
+    padding: 22px 26px 24px;
+    animation: modalPop .18s var(--ease);
+  }
+  .q-head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 14px;
+  }
+  .q-tag {
+    display: inline-flex; align-items: center;
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: color-mix(in oklch, var(--ag, var(--accent)) 14%, transparent);
+    border: 1px solid color-mix(in oklch, var(--ag, var(--accent)) 32%, transparent);
+    color: color-mix(in oklch, var(--ag, var(--accent)) 70%, var(--text));
+    font: 700 11px var(--font-mono);
+    letter-spacing: 0.04em;
+  }
+  .q-x {
+    width: 26px; height: 26px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid var(--hairline);
+    border-radius: 50%;
+    color: var(--muted);
+    font: 700 13px var(--font-text);
+    cursor: pointer;
+  }
+  .q-x:hover { color: var(--heading); border-color: var(--hairline-strong); }
+  .q-text {
+    color: var(--text);
+    font: 500 13.5px var(--font-mono);
+    line-height: 1.55;
+    padding: 12px 14px;
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-md);
+    max-height: 200px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .q-suggest {
+    display: flex; align-items: center; gap: 10px;
+    margin-top: 14px;
+    color: var(--muted);
+    font: 600 11px var(--font-mono);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .q-suggest-val {
+    padding: 2px 10px;
+    border-radius: 6px;
+    background: color-mix(in oklch, var(--accent) 14%, transparent);
+    border: 1px solid color-mix(in oklch, var(--accent) 28%, transparent);
+    color: var(--heading);
+    font-size: 13px;
+    text-transform: lowercase;
+    letter-spacing: 0;
+  }
+  .q-actions {
+    display: flex; gap: 10px; margin-top: 18px;
+  }
+  .q-btn {
+    flex: 1;
+    padding: 10px 16px;
+    border-radius: 10px;
+    border: 1px solid var(--hairline-strong);
+    background: var(--n-2);
+    color: var(--text);
+    font: 600 13px var(--font-text);
+    cursor: pointer;
+    transition: background .12s var(--ease), border-color .12s var(--ease), color .12s var(--ease), transform .08s var(--ease);
+  }
+  .q-btn:hover { background: var(--n-3); }
+  .q-btn:active { transform: translateY(1px); }
+  .q-btn-y { color: color-mix(in oklch, var(--good) 80%, var(--text)); }
+  .q-btn-n { color: color-mix(in oklch, var(--bad) 70%, var(--text)); }
+  .q-btn.rec {
+    border-color: color-mix(in oklch, var(--accent) 50%, transparent);
+    background: color-mix(in oklch, var(--accent) 14%, var(--n-2));
+    color: var(--heading);
+  }
+
+  /* ─ follow-up badge + modal (agent's response → suggested next prompt) ─ */
+  .t-sug {
+    margin-left: auto;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: color-mix(in oklch, var(--accent) 14%, transparent);
+    border: 1px solid color-mix(in oklch, var(--accent) 36%, transparent);
+    color: var(--heading);
+    font: 700 10px var(--font-mono);
+    cursor: pointer;
+    transition: background .12s var(--ease), border-color .12s var(--ease);
+  }
+  .t-sug:hover {
+    background: color-mix(in oklch, var(--accent) 24%, transparent);
+    border-color: color-mix(in oklch, var(--accent) 55%, transparent);
+  }
+  .t-sug + .t-q { margin-left: 6px; }
+
+  .f-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.42);
+    display: grid;
+    place-items: center;
+    padding: 48px 24px;
+    z-index: 1300;
+    animation: modalFadeIn .14s var(--ease);
+  }
+  .f-shell {
+    position: relative;
+    background: var(--n-1);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--r-xl);
+    box-shadow: var(--shadow-2);
+    max-width: 680px;
+    width: 100%;
+    max-height: calc(100vh - 96px);
+    padding: 22px 26px 24px;
+    display: flex; flex-direction: column;
+    gap: 14px;
+    overflow: hidden;
+    animation: modalPop .18s var(--ease);
+  }
+  .f-head {
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .f-tag {
+    display: inline-flex; align-items: center;
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: color-mix(in oklch, var(--ag, var(--accent)) 14%, transparent);
+    border: 1px solid color-mix(in oklch, var(--ag, var(--accent)) 32%, transparent);
+    color: color-mix(in oklch, var(--ag, var(--accent)) 70%, var(--text));
+    font: 700 11px var(--font-mono);
+    letter-spacing: 0.04em;
+  }
+  .f-x {
+    width: 26px; height: 26px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid var(--hairline);
+    border-radius: 50%;
+    color: var(--muted);
+    font: 700 13px var(--font-text);
+    cursor: pointer;
+  }
+  .f-x:hover { color: var(--heading); border-color: var(--hairline-strong); }
+  .f-sub {
+    font: 600 10.5px var(--font-mono);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .f-items {
+    list-style: none;
+    margin: 0;
+    padding: 6px 0 0;
+    max-height: 220px;
+    overflow-y: auto;
+    display: flex; flex-direction: column;
+    gap: 6px;
+  }
+  .f-item {
+    display: flex; gap: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--surface);
+    cursor: pointer;
+    transition: border-color .12s var(--ease), background .12s var(--ease);
+  }
+  .f-item:hover { border-color: var(--hairline-strong); }
+  .f-item input[type=checkbox] {
+    margin-top: 3px;
+    accent-color: var(--accent);
+  }
+  .f-item .f-title {
+    font: 600 12.5px var(--font-text);
+    color: var(--heading);
+    line-height: 1.35;
+  }
+  .f-item .f-detail {
+    margin-top: 3px;
+    font: 500 11.5px var(--font-mono);
+    color: var(--muted);
+    line-height: 1.4;
+  }
+  .f-item.on { background: color-mix(in oklch, var(--accent) 6%, var(--surface)); border-color: color-mix(in oklch, var(--accent) 30%, transparent); }
+
+  .f-prompt {
+    width: 100%;
+    min-height: 120px;
+    max-height: 240px;
+    resize: vertical;
+    padding: 10px 12px;
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--r-md);
+    background: var(--n-0);
+    color: var(--text);
+    font: 500 12.5px var(--font-mono);
+    line-height: 1.5;
+    outline: none;
+  }
+  .f-prompt:focus { border-color: color-mix(in oklch, var(--accent) 50%, transparent); }
+  .f-actions {
+    display: flex; gap: 10px; justify-content: flex-end;
+  }
+  .f-btn {
+    padding: 9px 18px;
+    border-radius: 10px;
+    border: 1px solid var(--hairline-strong);
+    background: var(--n-2);
+    color: var(--text);
+    font: 600 13px var(--font-text);
+    cursor: pointer;
+    transition: background .12s var(--ease), border-color .12s var(--ease), transform .08s var(--ease);
+  }
+  .f-btn:hover { background: var(--n-3); }
+  .f-btn:active { transform: translateY(1px); }
+  .f-btn.primary {
+    background: color-mix(in oklch, var(--accent) 22%, var(--n-2));
+    border-color: color-mix(in oklch, var(--accent) 55%, transparent);
+    color: var(--heading);
+  }
+  .f-btn.primary:hover { background: color-mix(in oklch, var(--accent) 32%, var(--n-2)); }
+  .f-btn[disabled] { opacity: .5; pointer-events: none; }
 
   /* ─ modal overlay (for adding projects on top of workspace) ─────────── */
   .modal-backdrop {
@@ -1596,9 +2974,10 @@ INDEX_HTML = r"""<!doctype html>
     color: var(--dim);
     background: var(--surface);
   }
-  .kind-tag.kind-single { color: var(--good); border-color: color-mix(in oklch, var(--good) 30%, transparent); }
-  .kind-tag.kind-split  { color: var(--accent); border-color: color-mix(in oklch, var(--accent) 36%, transparent); }
-  .kind-tag.kind-amend  { color: var(--warn); border-color: color-mix(in oklch, var(--warn) 30%, transparent); }
+  .kind-tag.kind-single  { color: var(--good); border-color: color-mix(in oklch, var(--good) 30%, transparent); }
+  .kind-tag.kind-split   { color: var(--accent); border-color: color-mix(in oklch, var(--accent) 36%, transparent); }
+  .kind-tag.kind-amend   { color: var(--warn); border-color: color-mix(in oklch, var(--warn) 30%, transparent); }
+  .kind-tag.kind-conduct { color: var(--heading); background: color-mix(in oklch, var(--accent) 22%, transparent); border-color: color-mix(in oklch, var(--accent) 50%, transparent); }
   .reason { font: 500 11px var(--font-mono); color: var(--dim); margin-top: 4px; padding-left: 14px; }
   .term-body {
     flex: 1;
@@ -1669,9 +3048,77 @@ INDEX_HTML = r"""<!doctype html>
     background: var(--muted); margin-right: 6px; vertical-align: 1px;
   }
 
+  /* ─ tasks panel (per-tile current + queue, above history) ────────── */
+  .tasks {
+    border-top: 1px solid var(--hairline);
+    max-height: 30%;
+    overflow-y: auto;
+    padding: 8px 4px 6px;
+  }
+  .tasks-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 0 6px 8px;
+    font: 700 10px var(--font-mono);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .tasks-head .t-count {
+    margin-left: auto;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    color: var(--muted);
+    font: 700 10px var(--font-mono);
+  }
+  .tasks-rows { display: flex; flex-direction: column; gap: 4px; }
+  .t-row {
+    padding: 6px 8px 7px;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: color-mix(in oklch, var(--n-1) 70%, transparent);
+  }
+  .t-head {
+    display: flex; align-items: center; gap: 8px;
+    font: 600 10.5px var(--font-mono);
+    color: var(--muted);
+  }
+  .t-head .led {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--muted);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--muted) 12%, transparent);
+  }
+  .t-head .led.run, .t-head .led.work { background: var(--good); box-shadow: 0 0 0 3px color-mix(in oklch, var(--good) 14%, transparent); }
+  .t-head .led.boot { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in oklch, var(--warn) 14%, transparent); }
+  .t-head .led.think { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 14%, transparent); }
+  .t-head .led.idle { background: var(--dim); box-shadow: 0 0 0 3px color-mix(in oklch, var(--dim) 14%, transparent); }
+  .t-head .led.exit { background: var(--bad); box-shadow: 0 0 0 3px color-mix(in oklch, var(--bad) 14%, transparent); }
+  .t-head .t-idx { color: var(--dim); }
+  .t-head .t-ag { color: var(--ag, var(--text)); font-weight: 700; }
+  .t-head .t-st { color: var(--muted); }
+  .t-head .t-q {
+    margin-left: auto;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: color-mix(in oklch, var(--warn) 14%, transparent);
+    color: color-mix(in oklch, var(--warn) 80%, var(--text));
+    font: 700 9.5px var(--font-mono);
+  }
+  .t-body { margin-top: 4px; padding-left: 14px; }
+  .t-now {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    font: 500 11.5px var(--font-mono);
+    color: var(--text);
+  }
+  .t-now.t-empty { color: var(--dim); font-style: italic; }
+
   .history {
     border-top: 1px solid var(--hairline);
-    max-height: 35%;
+    max-height: 30%;
     overflow-y: auto;
     padding: 6px 4px 8px;
   }
@@ -1702,6 +3149,376 @@ INDEX_HTML = r"""<!doctype html>
     margin-left: 4px;
   }
 
+  /* ─ conductor plan panel ─────────────────────────────────────────── */
+  .plan-panel {
+    border-top: 1px solid var(--hairline);
+    background: color-mix(in oklch, var(--n-2) 60%, transparent);
+    padding: 10px 14px 12px;
+    max-height: 28%;
+    overflow-y: auto;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+  }
+
+  /* ─ autopilot panel ───────────────────────────────────────────────── */
+  .ap-panel {
+    border-top: 1px solid var(--hairline);
+    background: color-mix(in oklch, var(--accent) 6%, var(--n-1));
+    padding: 10px 14px 12px;
+    display: flex; flex-direction: column;
+    gap: 8px;
+    font-family: var(--font-mono);
+  }
+  .ap-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px;
+  }
+  .ap-eyebrow {
+    display: inline-flex; align-items: center; gap: 8px;
+    font: 700 10px var(--font-mono);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .ap-led {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--muted);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--muted) 12%, transparent);
+  }
+  .ap-led.run  { background: var(--good); box-shadow: 0 0 0 3px color-mix(in oklch, var(--good) 14%, transparent); animation: ap-pulse 1.6s var(--ease) infinite; }
+  .ap-led.boot { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in oklch, var(--warn) 14%, transparent); }
+  .ap-led.idle { background: var(--good); box-shadow: 0 0 0 3px color-mix(in oklch, var(--good) 14%, transparent); }
+  .ap-led.exit { background: var(--bad);  box-shadow: 0 0 0 3px color-mix(in oklch, var(--bad) 14%, transparent); }
+  @keyframes ap-pulse { 0%,100% { opacity: 1 } 50% { opacity: .4 } }
+
+  .ap-tile {
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: color-mix(in oklch, var(--ag, var(--accent)) 14%, transparent);
+    border: 1px solid color-mix(in oklch, var(--ag, var(--accent)) 30%, transparent);
+    color: color-mix(in oklch, var(--ag, var(--accent)) 70%, var(--text));
+    font: 700 10px var(--font-mono);
+    letter-spacing: 0.04em;
+  }
+  .ap-goal {
+    font: 600 12.5px var(--font-text);
+    color: var(--heading);
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .ap-meta {
+    display: flex; gap: 8px; align-items: center;
+    font: 700 10px var(--font-mono);
+    color: var(--dim);
+  }
+  .ap-iter {
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    color: var(--muted);
+  }
+  .ap-verdict {
+    padding: 1px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--hairline);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .ap-v-continue { color: var(--accent); border-color: color-mix(in oklch, var(--accent) 40%, transparent); background: color-mix(in oklch, var(--accent) 8%, transparent); }
+  .ap-v-pause    { color: var(--warn);   border-color: color-mix(in oklch, var(--warn) 40%, transparent);   background: color-mix(in oklch, var(--warn) 8%, transparent); }
+  .ap-v-done     { color: var(--good);   border-color: color-mix(in oklch, var(--good) 40%, transparent);   background: color-mix(in oklch, var(--good) 8%, transparent); }
+  .ap-v-boot     { color: var(--muted);  border-color: var(--hairline); }
+  .ap-narration {
+    font: 500 11.5px var(--font-mono);
+    color: var(--text);
+    line-height: 1.45;
+    padding: 6px 10px;
+    border-left: 2px solid var(--accent);
+    background: color-mix(in oklch, var(--accent) 4%, transparent);
+    border-radius: 0 6px 6px 0;
+  }
+  .ap-cp { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+  .ap-sub {
+    font: 700 9.5px var(--font-mono);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .ap-next {
+    width: 100%;
+    min-height: 80px;
+    max-height: 180px;
+    resize: vertical;
+    padding: 8px 10px;
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--r-md);
+    background: var(--n-0);
+    color: var(--text);
+    font: 500 11.5px var(--font-mono);
+    line-height: 1.5;
+    outline: none;
+  }
+  .ap-next:focus { border-color: color-mix(in oklch, var(--accent) 50%, transparent); }
+  .ap-cp-actions {
+    display: flex; gap: 8px; justify-content: flex-end;
+  }
+  .ap-cp-actions.ap-running { margin-top: 2px; }
+  .ap-btn {
+    padding: 6px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--hairline-strong);
+    background: var(--n-2);
+    color: var(--text);
+    font: 600 11.5px var(--font-text);
+    cursor: pointer;
+    transition: background .12s var(--ease), border-color .12s var(--ease);
+  }
+  .ap-btn:hover { background: var(--n-3); }
+  .ap-btn.primary {
+    background: color-mix(in oklch, var(--accent) 22%, var(--n-2));
+    border-color: color-mix(in oklch, var(--accent) 55%, transparent);
+    color: var(--heading);
+  }
+  .ap-btn.primary:hover { background: color-mix(in oklch, var(--accent) 32%, var(--n-2)); }
+
+  .btn-ghost {
+    background: transparent !important;
+    border: 1px solid var(--hairline-strong);
+    color: var(--muted);
+  }
+  .btn-ghost:hover {
+    color: var(--heading);
+    border-color: color-mix(in oklch, var(--accent) 50%, transparent);
+    background: color-mix(in oklch, var(--accent) 8%, transparent) !important;
+  }
+  .plan-head {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+  .plan-head .title-block {
+    flex: 1;
+    min-width: 0;
+  }
+  .plan-head .eyebrow {
+    display: inline-flex; align-items: center; gap: 6px;
+    font: 700 9.5px var(--font-mono);
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 4px;
+  }
+  .plan-head .eyebrow::before {
+    content: '';
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .plan-head .plan-title {
+    font: 600 13px var(--font-text);
+    color: var(--heading);
+    line-height: 1.35;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+  .plan-head .plan-actions {
+    display: inline-flex;
+    gap: 4px;
+  }
+  .plan-head .plan-actions button {
+    background: transparent;
+    border: 1px solid var(--hairline-strong);
+    color: var(--dim);
+    border-radius: 6px;
+    padding: 3px 8px;
+    font: 600 10px var(--font-mono);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: color .12s var(--ease), border-color .12s var(--ease), background .12s var(--ease);
+  }
+  .plan-head .plan-actions button:hover {
+    color: var(--heading);
+    border-color: color-mix(in oklch, var(--n-9) 22%, transparent);
+  }
+  .plan-head .plan-actions .cancel:hover {
+    color: var(--bad);
+    border-color: color-mix(in oklch, var(--bad) 40%, transparent);
+    background: color-mix(in oklch, var(--bad) 8%, transparent);
+  }
+  .plan-reason {
+    font: 500 11px var(--font-mono);
+    color: var(--dim);
+    margin-bottom: 10px;
+    padding-left: 14px;
+    border-left: 1px solid var(--hairline);
+  }
+  .plan-progress {
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: 10px;
+  }
+  .plan-progress .bar {
+    flex: 1;
+    height: 4px;
+    background: var(--n-3);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .plan-progress .bar > div {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), color-mix(in oklch, var(--accent) 60%, var(--good)));
+    transition: width .25s var(--ease);
+  }
+  .plan-progress .label {
+    font: 600 10.5px var(--font-mono);
+    color: var(--dim);
+    min-width: 38px;
+    text-align: right;
+  }
+  .plan-tasks {
+    display: flex; flex-direction: column;
+    gap: 6px;
+  }
+  .ptask {
+    position: relative;
+    padding: 8px 10px 8px 12px;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: color-mix(in oklch, var(--n-3) 50%, transparent);
+    transition: border-color .15s var(--ease), background .15s var(--ease);
+  }
+  .ptask::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 8px; bottom: 8px;
+    width: 2px;
+    border-radius: 2px;
+    background: var(--ptask-rail, var(--hairline-strong));
+  }
+  .ptask[data-status="running"] {
+    border-color: color-mix(in oklch, var(--accent) 36%, transparent);
+    background: color-mix(in oklch, var(--accent) 7%, var(--n-3));
+    --ptask-rail: var(--accent);
+  }
+  .ptask[data-status="done"]     { --ptask-rail: var(--good); }
+  .ptask[data-status="failed"]   { --ptask-rail: var(--bad);
+    border-color: color-mix(in oklch, var(--bad) 32%, transparent); }
+  .ptask[data-status="blocked"]  { --ptask-rail: color-mix(in oklch, var(--bad) 60%, var(--muted)); opacity: .75; }
+  .ptask[data-status="skipped"]  { --ptask-rail: var(--muted); opacity: .55; }
+  .ptask[data-status="ready"]    { --ptask-rail: var(--warn); }
+  .ptask-top {
+    display: flex; align-items: center; gap: 8px;
+    flex-wrap: wrap;
+  }
+  .ptask-id {
+    flex: none;
+    display: inline-flex; align-items: center;
+    height: 18px; padding: 0 6px;
+    border-radius: 4px;
+    background: color-mix(in oklch, var(--ptask-rail, var(--accent)) 18%, transparent);
+    color: color-mix(in oklch, var(--ptask-rail, var(--accent)) 70%, var(--text));
+    font: 700 10px var(--font-mono);
+    letter-spacing: 0.04em;
+  }
+  .ptask-title {
+    flex: 1;
+    min-width: 0;
+    color: var(--heading);
+    font: 600 12px var(--font-text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .ptask-status {
+    flex: none;
+    display: inline-flex; align-items: center; gap: 5px;
+    font: 600 10px var(--font-mono);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: color-mix(in oklch, var(--ptask-rail, var(--muted)) 75%, var(--text));
+  }
+  .ptask-status .pulse {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 0 3px color-mix(in oklch, currentColor 25%, transparent);
+  }
+  .ptask[data-status="running"] .ptask-status .pulse {
+    animation: ptask-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes ptask-pulse {
+    0%, 100% { box-shadow: 0 0 0 0   color-mix(in oklch, currentColor 40%, transparent); }
+    50%      { box-shadow: 0 0 0 6px color-mix(in oklch, currentColor 0%,  transparent); }
+  }
+  .ptask-meta {
+    display: flex; align-items: center; gap: 10px;
+    margin-top: 5px;
+    font: 500 10.5px var(--font-mono);
+    color: var(--muted);
+    flex-wrap: wrap;
+  }
+  .ptask-meta .deps,
+  .ptask-meta .tile,
+  .ptask-meta .note {
+    display: inline-flex; align-items: center; gap: 4px;
+  }
+  .ptask-meta .chip {
+    display: inline-flex; align-items: center;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--n-3);
+    color: var(--dim);
+    font-weight: 600;
+    font-size: 10px;
+  }
+  .ptask-meta .tile .chip { background: color-mix(in oklch, var(--ag, var(--accent)) 18%, var(--n-3)); color: var(--heading); }
+  .ptask-meta .note { color: var(--bad); }
+  .ptask[data-status="done"] .ptask-meta .note,
+  .ptask[data-status="skipped"] .ptask-meta .note { color: var(--muted); }
+  .ptask-prompt {
+    margin-top: 6px;
+    padding: 6px 8px;
+    background: var(--n-2);
+    border-radius: 4px;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    display: none;
+    max-height: 160px;
+    overflow-y: auto;
+  }
+  .ptask.expanded .ptask-prompt { display: block; }
+  .ptask-actions {
+    margin-top: 6px;
+    display: inline-flex;
+    gap: 6px;
+  }
+  .ptask-actions button {
+    background: transparent;
+    border: 1px solid var(--hairline);
+    color: var(--muted);
+    border-radius: 5px;
+    padding: 2px 8px;
+    font: 600 10px var(--font-mono);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: color .12s var(--ease), border-color .12s var(--ease);
+  }
+  .ptask-actions button:hover { color: var(--heading); border-color: var(--hairline-strong); }
+  .ptask-actions .skip:hover { color: var(--warn); border-color: color-mix(in oklch, var(--warn) 36%, transparent); }
+  .plan-empty {
+    color: var(--muted);
+    font: 500 11.5px var(--font-mono);
+    padding: 8px 4px;
+  }
+
   /* small screens */
   @media (max-width: 900px) {
     .main { grid-template-columns: 1fr; }
@@ -1724,10 +3541,13 @@ const state = {
   // wizard draft (filled while user picks agent + folder + count)
   draft: { agent: null, folder: '', count: 4 },
   // open projects; each is its own workspace
-  projects: [],          // [{id, agent, folder, count, sessions, tileAgents, history}]
+  projects: [],          // [{id, agent, folder, count, sessions, tileAgents, history, activePlanId}]
   activeProjectId: null,
   // global registry of mounted xterms, indexed by sid (sids are globally unique)
   terms: {},             // sid -> {term, fit, ws, swapping, mounted}
+  // active conductor plans, keyed by plan_id. each entry survives re-renders
+  // so the WS stays open across the workspace's frequent innerHTML rewrites.
+  plans: {},             // plan_id -> { plan, projectId, ws, expanded: Set<task_id> }
   statusPoll: null,
   railCollapsed: false,
 };
@@ -2049,10 +3869,22 @@ function viewWorkspace() {
           </div>
           <div class="sidebar-foot">
             <span class="status" id="bcast-status"><span class="dot"></span>ready</span>
+            <button class="btn btn-ghost" id="autopilot" type="button" title="self-driving loop on the chosen tile">
+              ▶ autopilot
+            </button>
             <button class="btn" id="send" type="button">
               Route &amp; send
               <span class="kbd">⌘↵</span>
             </button>
+          </div>
+          <div id="autopilot-host">
+            ${renderAutopilotPanel()}
+          </div>
+          <div id="plan-panel-host">
+            ${renderPlanPanel()}
+          </div>
+          <div class="tasks" id="tasks">
+            ${renderTasks()}
           </div>
           <div class="history" id="history">
             ${renderHistory()}
@@ -2060,6 +3892,428 @@ function viewWorkspace() {
         </aside>
       </div>
     </div>
+  `;
+}
+
+/* ─ conductor plan ─────────────────────────────────────────────────── */
+
+const PLAN_STATUS_LABEL = {
+  pending: 'queued',
+  ready:   'ready',
+  running: 'running',
+  done:    'done',
+  failed:  'failed',
+  skipped: 'skipped',
+  blocked: 'blocked',
+};
+
+function activePlan() {
+  const p = proj();
+  if (!p || !p.activePlanId) return null;
+  return state.plans[p.activePlanId] || null;
+}
+
+function tileIndex(p, sid) {
+  if (!p || !sid) return 0;
+  const i = p.sessions.indexOf(sid);
+  return i >= 0 ? i + 1 : 0;
+}
+
+function tileChip(p, sid) {
+  if (!p || !sid) return '';
+  const ag = state.agents[p.tileAgents[sid] || p.agent];
+  const idx = tileIndex(p, sid);
+  const label = ag ? ag.label.split(' ')[0].toLowerCase() : sid;
+  const accent = ag ? ag.accent : 'var(--muted)';
+  return `<span class="tile" style="--ag:${accent}"><span class="chip">#${String(idx).padStart(2,'0')} · ${escapeHtml(label)}</span></span>`;
+}
+
+function renderPlanPanel() {
+  const entry = activePlan();
+  if (!entry || !entry.plan) return '';
+  const p = proj();
+  const plan = entry.plan;
+  const tasks = plan.tasks || [];
+  const total = tasks.length;
+  const done = tasks.filter(t => t.status === 'done').length;
+  const failed = tasks.filter(t => t.status === 'failed' || t.status === 'blocked').length;
+  const pct = total ? Math.round(((done + failed) / total) * 100) : 0;
+
+  const planning = plan.cancelled
+    ? 'cancelled'
+    : (plan.completed ? (failed ? 'finished with errors' : 'complete') : 'in progress');
+
+  const tasksHtml = tasks.map(t => renderPlanTask(t, p, entry)).join('');
+
+  const cancelBtn = (!plan.completed && !plan.cancelled)
+    ? `<button class="cancel" data-plan-cancel="${plan.plan_id}" title="cancel remaining tasks">cancel</button>`
+    : '';
+  const dismissBtn = (plan.completed || plan.cancelled)
+    ? `<button class="dismiss" data-plan-dismiss="${plan.plan_id}" title="dismiss the plan panel">dismiss</button>`
+    : '';
+
+  return `
+    <div class="plan-panel" data-plan-id="${plan.plan_id}">
+      <div class="plan-head">
+        <div class="title-block">
+          <div class="eyebrow">Tasks · ${escapeHtml(planning)}</div>
+          <div class="plan-title">${escapeHtml(plan.title || 'multi-step plan')}</div>
+        </div>
+        <div class="plan-actions">
+          ${cancelBtn}${dismissBtn}
+        </div>
+      </div>
+      ${plan.reasoning ? `<div class="plan-reason">${escapeHtml(plan.reasoning)}</div>` : ''}
+      <div class="plan-progress" aria-label="plan progress">
+        <div class="bar"><div style="width:${pct}%"></div></div>
+        <span class="label">${done}/${total}</span>
+      </div>
+      <div class="plan-tasks">
+        ${tasksHtml || '<div class="plan-empty">no tasks in this plan</div>'}
+      </div>
+    </div>
+  `;
+}
+
+function renderPlanTask(t, p, entry) {
+  const status = t.status || 'pending';
+  const statusLabel = PLAN_STATUS_LABEL[status] || status;
+  const deps = (t.depends_on || []).length
+    ? `<span class="deps">↳ <span class="chip">${(t.depends_on||[]).map(escapeHtml).join(' · ')}</span></span>`
+    : '';
+  const tile = t.sid ? tileChip(p, t.sid) : '';
+  const note = t.note ? `<span class="note">· ${escapeHtml(t.note)}</span>` : '';
+  const expanded = entry.expanded && entry.expanded.has(t.id);
+  const promptShown = expanded
+    ? `<div class="ptask-prompt">${escapeHtml(t.prompt || '')}</div>`
+    : '';
+  const canSkip = (status === 'pending' || status === 'ready' || status === 'blocked')
+    ? `<button class="skip" data-plan-skip="${entry.plan.plan_id}" data-task-skip="${escapeHtml(t.id)}">skip</button>`
+    : '';
+  const toggleLabel = expanded ? 'hide prompt' : 'show prompt';
+  return `
+    <div class="ptask ${expanded ? 'expanded' : ''}" data-status="${status}" data-task-id="${escapeHtml(t.id)}">
+      <div class="ptask-top">
+        <span class="ptask-id">${escapeHtml(t.id)}</span>
+        <span class="ptask-title">${escapeHtml(t.title || t.id)}</span>
+        <span class="ptask-status"><span class="pulse"></span>${escapeHtml(statusLabel)}</span>
+      </div>
+      <div class="ptask-meta">
+        ${deps}
+        ${tile}
+        ${note}
+      </div>
+      ${promptShown}
+      <div class="ptask-actions">
+        <button class="toggle" data-task-toggle="${escapeHtml(t.id)}">${toggleLabel}</button>
+        ${canSkip}
+      </div>
+    </div>
+  `;
+}
+
+function refreshPlanPanel() {
+  const host = document.getElementById('plan-panel-host');
+  if (!host) return;
+  host.innerHTML = renderPlanPanel();
+  wirePlanPanel();
+}
+
+/* ─ autopilot panel (one self-driving loop per project, optional) ─ */
+
+function activeAutopilot() {
+  const p = proj();
+  if (!p) return null;
+  const meta = state.taskState || {};
+  for (const sid of p.sessions) {
+    const m = meta[sid];
+    if (m && m.autopilot) return m.autopilot;
+  }
+  return null;
+}
+
+function renderAutopilotPanel() {
+  const ap = activeAutopilot();
+  if (!ap) return '';
+  const STATUS_CLASS = {
+    running: 'run', paused: 'boot', done: 'idle', stopped: 'exit',
+  };
+  const cls = STATUS_CLASS[ap.status] || 'idle';
+  const p = proj();
+  const idx = p ? p.sessions.indexOf(ap.sid) + 1 : 0;
+  const ag = p ? state.agents[p.tileAgents[ap.sid] || p.agent] : null;
+  const lastIter = ap.iterations && ap.iterations.length
+    ? ap.iterations[ap.iterations.length - 1]
+    : null;
+  const nextPromptDraft = (lastIter && lastIter.next_prompt) ? lastIter.next_prompt : '';
+  const editor = (ap.status === 'paused' && ap.awaiting_decision)
+    ? `
+      <div class="ap-cp">
+        <div class="ap-sub">next prompt · edit & resume</div>
+        <textarea class="ap-next" id="ap-next" spellcheck="false">${escapeHtml(nextPromptDraft)}</textarea>
+        <div class="ap-cp-actions">
+          <button class="ap-btn" id="ap-stop">stop</button>
+          <button class="ap-btn primary" id="ap-resume">continue ▶</button>
+        </div>
+      </div>
+    `
+    : (ap.status === 'running'
+        ? `<div class="ap-cp-actions ap-running"><button class="ap-btn" id="ap-stop">stop</button></div>`
+        : `<div class="ap-cp-actions"><button class="ap-btn" id="ap-stop">dismiss</button></div>`);
+  return `
+    <div class="ap-panel" data-loop-id="${ap.loop_id}">
+      <div class="ap-head">
+        <div class="ap-eyebrow">
+          <span class="ap-led ${cls}"></span>
+          <span>autopilot · ${escapeHtml(ap.status)}</span>
+        </div>
+        <span class="ap-tile" style="--ag:${ag ? ag.accent : 'var(--muted)'}">
+          #${String(idx).padStart(2,'0')} · ${escapeHtml(ag ? ag.label : '—')}
+        </span>
+      </div>
+      <div class="ap-goal" title="${escapeHtml(ap.goal)}">${escapeHtml(ap.goal)}</div>
+      <div class="ap-meta">
+        <span class="ap-iter">iter ${ap.iterations_count}</span>
+        ${ap.last_verdict ? `<span class="ap-verdict ap-v-${ap.last_verdict}">${escapeHtml(ap.last_verdict)}</span>` : ''}
+      </div>
+      ${ap.last_narration ? `<div class="ap-narration">${escapeHtml(ap.last_narration)}</div>` : ''}
+      ${editor}
+    </div>
+  `;
+}
+
+function refreshAutopilotPanel() {
+  const host = document.getElementById('autopilot-host');
+  if (!host) return;
+  // preserve the next-prompt textarea content if the user is editing
+  const cur = document.getElementById('ap-next');
+  const curVal = cur ? cur.value : null;
+  const curFocused = cur && document.activeElement === cur;
+  host.innerHTML = renderAutopilotPanel();
+  if (curVal !== null) {
+    const nxt = document.getElementById('ap-next');
+    if (nxt) { nxt.value = curVal; if (curFocused) nxt.focus(); }
+  }
+  wireAutopilotPanel();
+}
+
+function wireAutopilotPanel() {
+  const stop = document.getElementById('ap-stop');
+  if (stop) stop.onclick = stopAutopilot;
+  const resume = document.getElementById('ap-resume');
+  if (resume) resume.onclick = resumeAutopilot;
+}
+
+async function startAutopilot() {
+  const p = proj();
+  if (!p) return;
+  const ta = $('#prompt');
+  const goal = (ta ? ta.value : '').trim();
+  if (!goal) {
+    const st = $('#bcast-status');
+    if (st) st.innerHTML = `<span class="dot" style="background:var(--bad)"></span>need a goal first`;
+    return;
+  }
+  // pick the most-idle tile in the active project
+  const meta = state.taskState || {};
+  const order = {idle: 0, booting: 1, working: 2, thinking: 2, down: 9};
+  const sids = [...p.sessions].sort((a, b) => {
+    const sa = (meta[a] && meta[a].status) || 'booting';
+    const sb = (meta[b] && meta[b].status) || 'booting';
+    return (order[sa] ?? 9) - (order[sb] ?? 9);
+  });
+  // skip tiles already in an autopilot loop
+  const sid = sids.find(s => !(meta[s] && meta[s].autopilot));
+  if (!sid) {
+    const st = $('#bcast-status');
+    if (st) st.innerHTML = `<span class="dot" style="background:var(--bad)"></span>no free tile`;
+    return;
+  }
+  if (ta) ta.value = '';
+  try {
+    const r = await api('/api/autopilot/start', {method: 'POST', body: {sid, goal}});
+    if (r.ok) {
+      // pre-populate taskState so the panel shows immediately, before next poll
+      if (!state.taskState) state.taskState = {};
+      if (!state.taskState[sid]) state.taskState[sid] = {};
+      state.taskState[sid].autopilot = r.loop;
+      refreshAutopilotPanel();
+    } else {
+      const st = $('#bcast-status');
+      if (st) st.innerHTML = `<span class="dot" style="background:var(--bad)"></span>${escapeHtml(r.error || 'autopilot failed')}`;
+    }
+  } catch (e) {
+    const st = $('#bcast-status');
+    if (st) st.innerHTML = `<span class="dot" style="background:var(--bad)"></span>autopilot error: ${escapeHtml(e.message || '')}`;
+  }
+}
+
+async function stopAutopilot() {
+  const ap = activeAutopilot();
+  if (!ap) return;
+  try {
+    await api(`/api/autopilot/${ap.loop_id}/stop`, {method: 'POST', body: {}});
+    // clear local state so panel disappears immediately
+    const meta = state.taskState || {};
+    for (const sid in meta) {
+      if (meta[sid] && meta[sid].autopilot && meta[sid].autopilot.loop_id === ap.loop_id) {
+        meta[sid].autopilot = null;
+      }
+    }
+    refreshAutopilotPanel();
+  } catch (e) {}
+}
+
+async function resumeAutopilot() {
+  const ap = activeAutopilot();
+  if (!ap) return;
+  const ta = document.getElementById('ap-next');
+  const next_prompt = ta ? ta.value.trim() : '';
+  try {
+    const r = await api(`/api/autopilot/${ap.loop_id}/resume`, {method: 'POST', body: {next_prompt}});
+    if (r.ok) {
+      const meta = state.taskState || {};
+      const sid = r.loop.sid;
+      if (!meta[sid]) meta[sid] = {};
+      meta[sid].autopilot = r.loop;
+      refreshAutopilotPanel();
+    }
+  } catch (e) {}
+}
+
+function wirePlanPanel() {
+  $$('button[data-plan-cancel]').forEach(b => {
+    b.onclick = () => cancelPlan(b.dataset.planCancel);
+  });
+  $$('button[data-plan-dismiss]').forEach(b => {
+    b.onclick = () => dismissPlan(b.dataset.planDismiss);
+  });
+  $$('button[data-plan-skip]').forEach(b => {
+    b.onclick = () => skipPlanTask(b.dataset.planSkip, b.dataset.taskSkip);
+  });
+  $$('button[data-task-toggle]').forEach(b => {
+    b.onclick = () => {
+      const entry = activePlan();
+      if (!entry) return;
+      const tid = b.dataset.taskToggle;
+      entry.expanded = entry.expanded || new Set();
+      if (entry.expanded.has(tid)) entry.expanded.delete(tid);
+      else entry.expanded.add(tid);
+      refreshPlanPanel();
+    };
+  });
+}
+
+async function cancelPlan(planId) {
+  try { await api(`/api/conductor/${planId}/cancel`, {method: 'POST'}); }
+  catch (e) {}
+}
+
+async function skipPlanTask(planId, taskId) {
+  try { await api(`/api/conductor/${planId}/skip/${encodeURIComponent(taskId)}`, {method: 'POST'}); }
+  catch (e) {}
+}
+
+function dismissPlan(planId) {
+  const entry = state.plans[planId];
+  if (!entry) return;
+  if (entry.ws && entry.ws.readyState === WebSocket.OPEN) {
+    try { entry.ws.close(); } catch (e) {}
+  }
+  delete state.plans[planId];
+  const owner = state.projects.find(pr => pr.activePlanId === planId);
+  if (owner) owner.activePlanId = null;
+  refreshPlanPanel();
+}
+
+function attachConductor(planId, initialSnapshot, projectId) {
+  // close any prior plan attached to this project so panels don't stack
+  for (const pid in state.plans) {
+    if (state.plans[pid].projectId === projectId && pid !== planId) {
+      dismissPlan(pid);
+    }
+  }
+  const wsProto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${wsProto}//${location.host}/ws/conductor/${planId}`);
+  const entry = {
+    plan: initialSnapshot,
+    projectId,
+    ws,
+    expanded: new Set(),
+  };
+  state.plans[planId] = entry;
+  const owner = state.projects.find(p => p.id === projectId);
+  if (owner) owner.activePlanId = planId;
+
+  ws.onmessage = (ev) => {
+    let msg = null;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    handleConductorEvent(planId, msg);
+  };
+  ws.onclose = () => { /* preserve last-known state in the panel */ };
+  ws.onerror = () => { /* ignored — close handler will fire */ };
+
+  refreshPlanPanel();
+}
+
+function handleConductorEvent(planId, msg) {
+  const entry = state.plans[planId];
+  if (!entry) return;
+  if (msg.type === 'plan' && msg.snapshot) {
+    entry.plan = msg.snapshot;
+  } else if (msg.type === 'task_update' && msg.task) {
+    const tasks = entry.plan.tasks || [];
+    const idx = tasks.findIndex(t => t.id === msg.task.id);
+    if (idx >= 0) tasks[idx] = msg.task;
+    else tasks.push(msg.task);
+  } else if (msg.type === 'plan_done') {
+    if (msg.snapshot) entry.plan = msg.snapshot;
+    else {
+      entry.plan.completed = !msg.cancelled;
+      entry.plan.cancelled = !!msg.cancelled;
+    }
+  }
+  refreshPlanPanel();
+}
+
+function renderTasks() {
+  const p = proj();
+  if (!p) return '';
+  const meta = state.taskState || {};
+  const STATUS_DOT = { idle: 'idle', booting: 'boot', thinking: 'think', working: 'work', down: 'exit' };
+  const rows = p.sessions.map((sid, i) => {
+    const ag = state.agents[p.tileAgents[sid] || p.agent];
+    const m = meta[sid] || {};
+    const st = m.status || 'booting';
+    const cls = STATUS_DOT[st] || 'idle';
+    const current = (m.current || '').trim();
+    const queued = m.queued || 0;
+    const idx = String(i + 1).padStart(2, '0');
+    const body = current
+      ? `<span class="t-now">${escapeHtml(current)}</span>`
+      : `<span class="t-now t-empty">— idle —</span>`;
+    const qBadge = queued > 0 ? `<span class="t-q">+${queued} queued</span>` : '';
+    const sugN = m.suggestions && Array.isArray(m.suggestions.items) ? m.suggestions.items.length : 0;
+    const sugBadge = sugN > 0
+      ? `<button class="t-sug" data-sid="${sid}" title="open follow-up modal">💡 ${sugN}</button>`
+      : '';
+    return `
+      <div class="t-row">
+        <div class="t-head">
+          <span class="led ${cls}" aria-hidden="true"></span>
+          <span class="t-idx">#${idx}</span>
+          <span class="t-ag" style="--ag:${ag ? ag.accent : 'var(--muted)'}">${escapeHtml(ag ? ag.label : '—')}</span>
+          <span class="t-st">${escapeHtml(st)}</span>
+          ${sugBadge}
+          ${qBadge}
+        </div>
+        <div class="t-body">${body}</div>
+      </div>
+    `;
+  }).join('');
+  return `
+    <div class="tasks-head"><span>agents</span><span class="t-count">${p.sessions.length}</span></div>
+    <div class="tasks-rows">${rows}</div>
   `;
 }
 
@@ -2073,7 +4327,8 @@ function renderHistory() {
       const label = ag ? ag.label : r.sid;
       return `<div class="out"><span class="route-tag" style="--ag:${ag ? ag.accent : 'var(--muted)'}">#${String(idx).padStart(2,'0')} · ${escapeHtml(label)}</span> ${escapeHtml(r.prompt)}</div>`;
     }).join('');
-    const tag = h.kind ? `<span class="kind-tag kind-${h.kind}">${h.kind}</span>` : '';
+    const kindLabel = h.kind === 'conduct' ? 'tasks' : h.kind;
+    const tag = h.kind ? `<span class="kind-tag kind-${h.kind}">${kindLabel}</span>` : '';
     return `
       <div class="item">
         <div class="raw"><span class="glyph">›</span><span>${escapeHtml(h.raw)}</span>${tag}</div>
@@ -2179,6 +4434,8 @@ function wire() {
       setTimeout(() => { for (const sid in state.terms) { try { state.terms[sid].fit.fit(); } catch (e) {} } }, 220);
     };
     $('#send').onclick = sendPrompt;
+    const ap = $('#autopilot');
+    if (ap) ap.onclick = startAutopilot;
     const ta = $('#prompt');
     ta.addEventListener('keydown', e => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
@@ -2187,6 +4444,8 @@ function wire() {
       }
     });
     ta.focus();
+    wirePlanPanel();
+    wireAutopilotPanel();
   }
 }
 
@@ -2209,6 +4468,14 @@ function confirmDeleteProject(pid) {
 async function deleteProject(pid) {
   const p = state.projects.find(x => x.id === pid);
   if (!p) return;
+  // tear down any conductor plan attached to this project first so the
+  // server-side scheduler stops trying to dispatch to dead sids.
+  for (const planId in state.plans) {
+    if (state.plans[planId].projectId === pid) {
+      try { await api(`/api/conductor/${planId}/cancel`, {method: 'POST'}); } catch (e) {}
+      dismissPlan(planId);
+    }
+  }
   // kill each session on server + dispose local terminals
   for (const sid of p.sessions) {
     try { await api(`/api/session/${sid}`, {method: 'DELETE'}); } catch (e) {}
@@ -2494,12 +4761,16 @@ async function sendPrompt() {
     }
     const n = (r.routes || []).length;
     const kind = r.kind || 'single';
-    if (r.error) {
+    if (kind === 'conduct' && r.plan_id && r.plan) {
+      const taskCount = (r.plan.tasks || []).length;
+      setStat(`conduct · ${taskCount} task${taskCount === 1 ? '' : 's'} planned`, 'var(--good)');
+      attachConductor(r.plan_id, r.plan, p.id);
+    } else if (r.error) {
       setStat(`${kind} · sent to ${n} (${r.error.slice(0,40)})`, 'var(--warn)');
     } else {
       setStat(`${kind} · sent to ${n}`, 'var(--good)');
     }
-    p.history.push({raw, kind, routes: r.routes || [], reasoning: r.reasoning || ''});
+    p.history.push({raw, kind, routes: r.routes || [], reasoning: r.reasoning || '', planId: r.plan_id || null});
     const hist = $('#history');
     if (hist) {
       hist.innerHTML = renderHistory();
@@ -2523,6 +4794,7 @@ async function pollStatus() {
   try {
     const r = await api('/api/state');
     const sessions = r.sessions || {};
+    state.taskState = sessions;
     for (const sid in sessions) {
       const meta = sessions[sid];
       const entry = state.terms[sid];
@@ -2530,6 +4802,245 @@ async function pollStatus() {
       if (entry.swapping) continue;
       const [text, cls] = STATUS_LABEL[meta.status] || ['—', 'idle'];
       setStatus(sid, text, cls);
+    }
+    const t = document.getElementById('tasks');
+    if (t) {
+      t.innerHTML = renderTasks();
+      t.querySelectorAll('.t-sug').forEach(b => {
+        b.onclick = (e) => { e.stopPropagation(); openFollowupModal(b.dataset.sid); };
+      });
+    }
+    refreshAutopilotPanel();
+    maybeOpenQuestionModal(sessions);
+  } catch (e) {}
+}
+
+/* ─ y/n question modal ────────────────────────────────────────────── */
+
+function maybeOpenQuestionModal(sessions) {
+  if (state.questionModalOpen) {
+    // already showing one; update its suggestion if it just arrived
+    const cur = state.activeQuestion;
+    if (cur) {
+      const m = sessions[cur.sid];
+      if (m && m.question && m.question.sig === cur.q.sig && m.question.suggestion && !cur.q.suggestion) {
+        cur.q.suggestion = m.question.suggestion;
+        const el = document.getElementById('q-suggest-val');
+        if (el) el.textContent = m.question.suggestion;
+        const yBtn = document.getElementById('q-btn-y');
+        const nBtn = document.getElementById('q-btn-n');
+        if (yBtn && nBtn) {
+          yBtn.classList.toggle('rec', m.question.suggestion === 'y');
+          nBtn.classList.toggle('rec', m.question.suggestion === 'n');
+        }
+      }
+      // if the server dropped the question (e.g. someone typed into the
+      // tile directly), close the modal — it no longer applies.
+      if (!m || !m.question || m.question.sig !== cur.q.sig) {
+        closeQuestionModal();
+      }
+    }
+    return;
+  }
+  const p = proj();
+  if (!p) return;
+  for (const sid of p.sessions) {
+    const m = sessions[sid];
+    if (!m || !m.question) continue;
+    if (state.dismissedQuestionSig === m.question.sig) continue;
+    openQuestionModal(sid, m.question);
+    return;
+  }
+}
+
+function openQuestionModal(sid, q) {
+  const p = proj();
+  if (!p) return;
+  const idx = p.sessions.indexOf(sid) + 1;
+  const ag = state.agents[p.tileAgents[sid] || p.agent];
+  state.activeQuestion = { sid, q };
+  state.questionModalOpen = true;
+  const sug = q.suggestion || '…';
+  const recY = q.suggestion === 'y';
+  const recN = q.suggestion === 'n';
+  const node = document.createElement('div');
+  node.id = 'q-modal';
+  node.className = 'q-backdrop';
+  node.innerHTML = `
+    <div class="q-shell" role="dialog" aria-modal="true" aria-label="agent question">
+      <div class="q-head">
+        <span class="q-tag" style="--ag:${ag ? ag.accent : 'var(--muted)'}">#${String(idx).padStart(2,'0')} · ${escapeHtml(ag ? ag.label : '—')} asks</span>
+        <button class="q-x" id="q-x" title="dismiss" aria-label="dismiss">×</button>
+      </div>
+      <div class="q-text">${escapeHtml(q.text || '')}</div>
+      <div class="q-suggest">
+        <span class="q-suggest-label">llama suggests</span>
+        <span class="q-suggest-val" id="q-suggest-val">${escapeHtml(sug)}</span>
+      </div>
+      <div class="q-actions">
+        <button class="q-btn q-btn-n ${recN ? 'rec' : ''}" id="q-btn-n">deny · n</button>
+        <button class="q-btn q-btn-y ${recY ? 'rec' : ''}" id="q-btn-y">accept · y</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(node);
+  const close = () => closeQuestionModal();
+  const onKey = (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); dismissQuestion(); }
+    else if (e.key === 'y' || e.key === 'Y') { e.preventDefault(); answerQuestion('y'); }
+    else if (e.key === 'n' || e.key === 'N') { e.preventDefault(); answerQuestion('n'); }
+  };
+  state._qKeyHandler = onKey;
+  document.addEventListener('keydown', onKey);
+  document.getElementById('q-x').onclick = dismissQuestion;
+  document.getElementById('q-btn-y').onclick = () => answerQuestion(q.suggestion || 'y');
+  document.getElementById('q-btn-n').onclick = dismissQuestion;
+  node.onclick = (e) => { if (e.target === node) dismissQuestion(); };
+}
+
+function closeQuestionModal() {
+  const n = document.getElementById('q-modal');
+  if (n) n.remove();
+  if (state._qKeyHandler) document.removeEventListener('keydown', state._qKeyHandler);
+  state._qKeyHandler = null;
+  state.questionModalOpen = false;
+  state.activeQuestion = null;
+}
+
+function dismissQuestion() {
+  const cur = state.activeQuestion;
+  if (cur) state.dismissedQuestionSig = cur.q.sig;
+  closeQuestionModal();
+}
+
+async function answerQuestion(answer) {
+  const cur = state.activeQuestion;
+  if (!cur) return;
+  const sid = cur.sid;
+  // clear dismissed sig so future questions on the same tile still trigger
+  state.dismissedQuestionSig = null;
+  closeQuestionModal();
+  try { await api(`/api/answer/${sid}`, {method: 'POST', body: {answer}}); } catch (e) {}
+}
+
+/* ─ follow-up modal (agent suggestions → editable prompt) ─────────── */
+
+function openFollowupModal(sid) {
+  const p = proj();
+  if (!p) return;
+  const m = (state.taskState || {})[sid];
+  if (!m || !m.suggestions || !Array.isArray(m.suggestions.items) || !m.suggestions.items.length) return;
+  const items = m.suggestions.items;
+  const ag = state.agents[p.tileAgents[sid] || p.agent];
+  const idx = p.sessions.indexOf(sid) + 1;
+  state.activeFollowup = {
+    sid,
+    items,
+    selected: items.map(() => true),
+  };
+  const node = document.createElement('div');
+  node.id = 'f-modal';
+  node.className = 'f-backdrop';
+  const itemsHtml = items.map((it, i) => `
+    <li>
+      <label class="f-item on" data-i="${i}">
+        <input type="checkbox" checked />
+        <div>
+          <div class="f-title">${escapeHtml(it.title || '')}</div>
+          ${it.detail ? `<div class="f-detail">${escapeHtml(it.detail)}</div>` : ''}
+        </div>
+      </label>
+    </li>
+  `).join('');
+  node.innerHTML = `
+    <div class="f-shell" role="dialog" aria-modal="true" aria-label="follow-up">
+      <div class="f-head">
+        <span class="f-tag" style="--ag:${ag ? ag.accent : 'var(--muted)'}">↪ follow-up · #${String(idx).padStart(2,'0')} · ${escapeHtml(ag ? ag.label : '—')}</span>
+        <button class="f-x" id="f-x" title="dismiss" aria-label="dismiss">×</button>
+      </div>
+      <div class="f-sub">Suggestions · pick what to implement</div>
+      <ul class="f-items">${itemsHtml}</ul>
+      <div class="f-sub">Prompt</div>
+      <textarea id="f-prompt" class="f-prompt" spellcheck="false"></textarea>
+      <div class="f-actions">
+        <button class="f-btn" id="f-cancel">Cancel</button>
+        <button class="f-btn primary" id="f-send">Route &amp; send</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(node);
+  refreshFollowupPrompt();
+  const onKey = (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); closeFollowupModal(); }
+    else if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); sendFollowup(); }
+  };
+  state._fKeyHandler = onKey;
+  document.addEventListener('keydown', onKey);
+  document.getElementById('f-x').onclick = closeFollowupModal;
+  document.getElementById('f-cancel').onclick = closeFollowupModal;
+  document.getElementById('f-send').onclick = sendFollowup;
+  node.onclick = (e) => { if (e.target === node) closeFollowupModal(); };
+  node.querySelectorAll('.f-item').forEach(lbl => {
+    lbl.addEventListener('click', (e) => {
+      // checkbox already toggles itself; sync the state + reflect ".on" class
+      setTimeout(() => {
+        const i = parseInt(lbl.dataset.i, 10);
+        const cb = lbl.querySelector('input[type=checkbox]');
+        state.activeFollowup.selected[i] = !!cb.checked;
+        lbl.classList.toggle('on', !!cb.checked);
+        refreshFollowupPrompt();
+      }, 0);
+    });
+  });
+}
+
+function refreshFollowupPrompt() {
+  const fp = state.activeFollowup;
+  if (!fp) return;
+  const ta = document.getElementById('f-prompt');
+  if (!ta) return;
+  // preserve manual edits: only regenerate if the textarea hasn't been
+  // touched OR matches the previously generated text exactly.
+  const lastGen = state._fLastGenerated || '';
+  if (ta.value && ta.value !== lastGen) return;
+  const picked = fp.items.filter((_, i) => fp.selected[i]);
+  if (!picked.length) {
+    ta.value = '';
+    state._fLastGenerated = '';
+    document.getElementById('f-send').disabled = true;
+    return;
+  }
+  const lines = picked.map((it, i) => `${i + 1}. ${it.title}${it.detail ? ' — ' + it.detail : ''}`);
+  const text = `Implement the following items from your previous analysis:\n\n${lines.join('\n')}`;
+  ta.value = text;
+  state._fLastGenerated = text;
+  document.getElementById('f-send').disabled = false;
+}
+
+function closeFollowupModal() {
+  const n = document.getElementById('f-modal');
+  if (n) n.remove();
+  if (state._fKeyHandler) document.removeEventListener('keydown', state._fKeyHandler);
+  state._fKeyHandler = null;
+  state._fLastGenerated = '';
+  state.activeFollowup = null;
+}
+
+async function sendFollowup() {
+  const fp = state.activeFollowup;
+  if (!fp) return;
+  const ta = document.getElementById('f-prompt');
+  const prompt = (ta ? ta.value : '').trim();
+  if (!prompt) return;
+  const sid = fp.sid;
+  closeFollowupModal();
+  try {
+    const r = await api('/api/route', {method: 'POST', body: {prompt, sids: [sid]}});
+    const p = proj();
+    if (p && r.ok) {
+      p.history.push({raw: prompt, kind: r.kind || 'single', routes: r.routes || [], reasoning: r.reasoning || ''});
+      const hist = $('#history');
+      if (hist) { hist.innerHTML = renderHistory(); hist.scrollTop = 0; }
     }
   } catch (e) {}
 }
