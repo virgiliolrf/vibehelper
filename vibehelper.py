@@ -420,32 +420,46 @@ async def api_spawn(req: SpawnReq):
     return {"sessions": ids}
 
 
-ROUTER_SYSTEM = """You are the router of vibehelper, a tool that orchestrates multiple
-terminal coding agents (Claude Code, Gemini CLI). The user just typed a message.
-Your job is to decide which agent tile(s) should receive the message, and to
-rewrite the message so it is technical, specific, and actionable for each one.
+ROUTER_SYSTEM = """# Persona
+You are vibehelper's dispatch router — the brain that decides which terminal coding agent (Claude Code / Gemini CLI) runs each message the operator types. Tiles are independent PTYs, cwd'd into a project folder, in yolo / skip-permissions mode. You optimize for: parallel progress, zero duplicate work, and never bouncing a clarifying question back to the operator.
 
-You will receive:
-- the user's raw message
-- a list of tiles, each with: sid, agent (claude or gemini), status (idle, working, booting, down), and last_prompt (what we last sent it, if anything)
+# Input
+{
+  "user_message": str,
+  "tiles": [{ "sid", "agent", "status" (idle|working|booting|down), "last_prompt" }],
+  "project_readme": str   // the project's README, truncated to ~6KB. May be empty.
+}
+Skip any tile with status=down — it cannot receive prompts.
+`project_readme` is your ONLY source of ground truth about the project (stack, layout, purpose, conventions). Use it to pick the persona's specialty and to anchor the context. If it is empty, keep persona/context minimal and generic rather than inventing a stack.
 
-Rules:
-- NEVER send the same prompt to multiple tiles. Each tile must receive a distinct task.
-- If the user message describes ONE task, route to ONE tile — prefer an idle tile; if all are working, pick the one whose last_prompt is most semantically related to the new message (treat it as a follow-up to that tile's task), OR if it looks unrelated, pick the most-idle one anyway.
-- If the user message naturally splits into N independent subtasks (e.g. "build a landing page AND set up a database AND write a CLI"), split it into one route per available tile, up to the number of tiles. Each route gets its own focused subtask.
-- If the user message is a CORRECTION or PLAN CHANGE to something a tile is mid-task on, route it to that tile and phrase the prompt as a clear redirection ("Stop the current approach and instead ...").
-- Always rewrite each route as a clean, technical, directive prompt for a terminal coding AI. Strip fluff, keep specifics.
-- Do not include explanations inside the prompts themselves.
-
-Return STRICT JSON only, matching this schema:
+# Output — JSON only, this exact schema
 {
   "kind": "single" | "split" | "amend",
-  "routes": [
-    {"sid": "<tile sid>", "prompt": "<rewritten technical prompt>"}
-  ],
-  "reasoning": "<one short sentence describing your choice>"
+  "routes": [ { "sid": "...", "prompt": "..." } ],
+  "reasoning": "<phrase, ≤15 words>"
 }
-"""
+
+# Decision (first match wins)
+1. **amend** — operator is correcting or redirecting work a tile is mid-task on. Triggers: "no, ...", "stop", "actually ...", "use X instead", "change to ...". Route to that ONE tile. Prompt MUST start with "Stop the current approach and instead ...".
+2. **split** — message contains N truly independent subtasks (joined by "and" / list / numbered, no shared state). One route per available tile, up to len(tiles); each tile gets a distinct subtask.
+3. **single** — everything else. Exactly ONE tile. Preference order: idle > the tile whose `last_prompt` is most semantically related to the new message (treat as a follow-up) > least-busy.
+
+Hard constraints: never assign the same prompt to two tiles; never route to a down tile.
+
+# Rewriting rules — every route's `prompt` must give the agent persona + context + task
+
+Structure each rewritten prompt as one tight paragraph (3–5 sentences), in this order:
+1. **PERSONA** — one line giving the agent its role for this specific task, matched to the stack ("Act as a senior React engineer", "You are a Python backend engineer focused on Postgres performance", "Act as a DevOps engineer comfortable with Docker and CI"). Pick a role specific to the work — never generic ("you are an AI assistant").
+2. **CONTEXT** — one or two sentences locating the task: what file/module/area is touched, what already exists or what this builds on, the relevant stack and constraints. Use the tile's `last_prompt` as a continuity hint when relevant. Never invent files, modules, or libraries the operator didn't mention.
+3. **TASK** — imperative instruction starting with a verb (Build / Fix / Refactor / Add / Implement / Remove / Wire up). State the deliverable concretely and list every constraint the operator named.
+
+Hard rules:
+- Preserve every concrete the operator gave — file paths, function/component names, libraries, commands, constraints.
+- Strip filler ("could you", "I want to", "make sure to") without losing any constraint.
+- No "please", no rationale paragraph ("because ..."), no questions back to the operator.
+
+# Reasoning rule
+≤ 15 words. Name the kind and the why-this-tile/split (e.g. "amend — tile 03 mid-refactor of auth.ts")."""
 
 
 def _submit_to_session(sess: "Session", prompt: str) -> None:
@@ -464,6 +478,33 @@ def _submit_to_session(sess: "Session", prompt: str) -> None:
 class RouteReq(BaseModel):
     prompt: str
     sids: Optional[list[str]] = None  # if set, restrict routing to this subset
+
+
+_README_NAMES = ("README.md", "README.MD", "Readme.md", "readme.md", "README", "README.rst", "README.txt")
+_README_MAX_BYTES = 6000  # ~1500 tokens — keep the router prompt fast
+_readme_cache: Dict[str, str] = {}
+
+
+def _get_project_readme(folder: str) -> str:
+    """Read the project's README so the router has real context (stack, layout,
+    intent) instead of inventing it. Cached per-folder; capped to 6KB."""
+    if folder in _readme_cache:
+        return _readme_cache[folder]
+    text = ""
+    try:
+        base = Path(folder).expanduser()
+        for name in _README_NAMES:
+            p = base / name
+            if p.is_file():
+                raw = p.read_bytes()[: _README_MAX_BYTES + 1]
+                text = raw.decode("utf-8", errors="replace")
+                if len(raw) > _README_MAX_BYTES:
+                    text = text[:_README_MAX_BYTES] + "\n…[truncated]"
+                break
+    except Exception:
+        text = ""
+    _readme_cache[folder] = text
+    return text
 
 
 def _build_tile_snapshot(sids: Optional[list[str]] = None) -> list[dict]:
@@ -505,9 +546,20 @@ async def api_route(req: RouteReq):
     decision: dict = {"kind": "single", "routes": [], "reasoning": ""}
     error: Optional[str] = None
 
+    # all tiles in a route call share the same folder (one project); grab
+    # its README so the router can ground its persona/context in reality.
+    folder = ""
+    first = SESSIONS.get(tiles[0]["sid"]) if tiles else None
+    if first is not None:
+        folder = first.folder
+    readme = _get_project_readme(folder) if folder else ""
+
     if groq_client is not None:
         try:
-            user_payload = json.dumps({"user_message": raw, "tiles": tiles}, ensure_ascii=False)
+            user_payload = json.dumps(
+                {"user_message": raw, "tiles": tiles, "project_readme": readme},
+                ensure_ascii=False,
+            )
             resp = await asyncio.to_thread(
                 groq_client.chat.completions.create,
                 model=GROQ_MODEL,
@@ -659,7 +711,20 @@ async def ws_endpoint(ws: WebSocket, sid: str):
     pump_task = asyncio.create_task(pump_to_ws())
 
     async def initial():
-        await asyncio.sleep(2.8)
+        # Wait until the agent has finished booting and drawn its idle
+        # input box (╭ ... │ ...) before typing — a flat sleep was racing
+        # Gemini's slower cold start and the prompt vanished into the void.
+        # Cap at 30s so a broken agent doesn't block forever.
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            if not sess.alive or sess.initial_sent:
+                return
+            tail = bytes(sess.output_tail[-1024:])
+            if IDLE_HINT_BYTES in tail and PIPE_HINT_BYTES in tail:
+                # one more breath so the prompt is fully painted before typing
+                await asyncio.sleep(0.25)
+                break
+            await asyncio.sleep(0.12)
         if sess.alive and not sess.initial_sent:
             sess.initial_sent = True
             _submit_to_session(sess, INITIAL_PROMPT)
@@ -1266,18 +1331,37 @@ INDEX_HTML = r"""<!doctype html>
     min-height: 0;
   }
   .main-rail {
-    grid-template-columns: 68px 1fr 380px;
+    grid-template-columns: var(--rail-w, 208px) 1fr 380px;
+    transition: grid-template-columns .18s var(--ease);
   }
   .proj-rail {
     display: flex; flex-direction: column;
-    gap: 6px;
-    padding: 6px 4px;
     background: color-mix(in oklch, var(--n-1) 80%, transparent);
     border: 1px solid var(--hairline);
     border-radius: var(--r-lg);
     min-height: 0;
+    overflow: hidden;
+  }
+  .proj-rail-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 8px;
+    padding: 10px 12px 10px 14px;
+    border-bottom: 1px solid var(--hairline);
+    background: color-mix(in oklch, var(--n-2) 40%, transparent);
+  }
+  .proj-rail-title {
+    font: 700 10px var(--font-mono);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .proj-rail-list {
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
-    align-items: stretch;
+    padding: 6px;
+    display: flex; flex-direction: column;
+    gap: 2px;
   }
   .proj-tab-wrap {
     position: relative;
@@ -1285,24 +1369,28 @@ INDEX_HTML = r"""<!doctype html>
   .proj-tab-wrap:hover .proj-tab-close,
   .proj-tab-wrap:focus-within .proj-tab-close {
     opacity: 1;
-    transform: scale(1);
+    transform: translateY(-50%) scale(1);
   }
   .proj-tab-close {
     position: absolute;
-    top: 2px;
-    right: 2px;
-    width: 16px; height: 16px;
+    top: 50%;
+    right: 6px;
+    transform: translateY(-50%) scale(0.85);
+    width: 18px; height: 18px;
     padding: 0;
     background: var(--n-3);
     color: var(--muted);
     border: 1px solid var(--hairline);
     border-radius: 50%;
-    font: 700 11px var(--font-text);
-    line-height: 14px;
+    font: 700 12px var(--font-text);
+    line-height: 16px;
     cursor: pointer;
     opacity: 0;
-    transform: scale(0.7);
     transition: opacity .12s var(--ease), transform .12s var(--ease), color .12s var(--ease), background .12s var(--ease);
+  }
+  .proj-tab-wrap:hover .proj-tab .num,
+  .proj-tab-wrap:focus-within .proj-tab .num {
+    opacity: 0;
   }
   .proj-tab-close:hover {
     background: var(--bad);
@@ -1311,57 +1399,110 @@ INDEX_HTML = r"""<!doctype html>
   }
   .proj-tab {
     width: 100%;
-    display: flex; flex-direction: column; align-items: center; gap: 2px;
-    padding: 8px 4px;
+    position: relative;
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px 9px 14px;
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 10px;
-    color: var(--muted);
+    border-radius: 8px;
+    color: var(--text);
     cursor: pointer;
     transition: background .15s var(--ease), color .15s var(--ease), border-color .15s var(--ease);
-    font: 600 9.5px var(--font-mono);
-    text-transform: lowercase;
-    letter-spacing: 0.02em;
+    font: 500 13px var(--font-text);
+    text-align: left;
     --ag: var(--accent);
   }
   .proj-tab .dot {
+    flex: none;
     width: 8px; height: 8px; border-radius: 50%;
     background: var(--ag);
-    box-shadow: 0 0 0 3px color-mix(in oklch, var(--ag) 18%, transparent);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--ag) 16%, transparent);
   }
   .proj-tab .label {
-    max-width: 56px;
+    flex: 1;
+    min-width: 0;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    color: var(--text);
   }
   .proj-tab .num {
-    color: var(--dim);
-    font-size: 9px;
+    flex: none;
+    min-width: 22px;
+    height: 20px;
+    padding: 0 7px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 999px;
+    background: color-mix(in oklch, var(--ag) 16%, transparent);
+    color: color-mix(in oklch, var(--ag) 70%, var(--text));
+    font: 700 10.5px var(--font-mono);
+    transition: opacity .12s var(--ease);
   }
   .proj-tab:hover {
     background: color-mix(in oklch, var(--ag) 6%, var(--n-2));
-    color: var(--text);
   }
   .proj-tab.on {
-    background: color-mix(in oklch, var(--ag) 14%, var(--n-2));
-    border-color: color-mix(in oklch, var(--ag) 30%, transparent);
+    background: color-mix(in oklch, var(--ag) 12%, var(--n-2));
+    border-color: color-mix(in oklch, var(--ag) 28%, transparent);
     color: var(--heading);
   }
-  .proj-add {
-    margin-top: auto;
-    padding: 12px 0;
-    background: transparent;
-    border: 1px dashed var(--hairline-strong);
-    border-radius: 10px;
-    color: var(--muted);
-    font: 700 16px var(--font-text);
-    cursor: pointer;
-    transition: color .15s var(--ease), border-color .15s var(--ease), background .15s var(--ease);
+  .proj-tab.on .label {
+    font-weight: 600;
+    color: var(--heading);
   }
-  .proj-add:hover {
+  .proj-tab.on::before {
+    content: '';
+    position: absolute;
+    left: 4px;
+    top: 8px;
+    bottom: 8px;
+    width: 2px;
+    border-radius: 2px;
+    background: var(--ag);
+  }
+  .proj-tab-rename {
+    flex: 1;
+    min-width: 0;
+    width: 100%;
+    padding: 0;
+    margin: 0;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--heading);
+    font: inherit;
+    font-weight: 600;
+  }
+  .proj-add, .proj-min {
+    width: 24px; height: 24px;
+    padding: 0;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    color: var(--muted);
+    font: 600 16px var(--font-text);
+    line-height: 1;
+    cursor: pointer;
+    transition: color .15s var(--ease), border-color .15s var(--ease), background .15s var(--ease), transform .18s var(--ease);
+  }
+  .proj-add:hover, .proj-min:hover {
     color: var(--heading);
     border-color: var(--accent);
     background: var(--accent-faint);
   }
+  .proj-rail-actions { display: inline-flex; gap: 6px; }
+  .proj-min svg { width: 12px; height: 12px; }
+
+  /* collapsed rail */
+  .main-rail.rail-collapsed { --rail-w: 56px; }
+  .rail-collapsed .proj-rail-head { padding: 10px 6px; flex-direction: column; gap: 6px; }
+  .rail-collapsed .proj-rail-title { display: none; }
+  .rail-collapsed .proj-min { transform: rotate(180deg); }
+  .rail-collapsed .proj-rail-list { padding: 6px 4px; align-items: stretch; }
+  .rail-collapsed .proj-tab { padding: 9px 4px; justify-content: center; gap: 0; }
+  .rail-collapsed .proj-tab .label,
+  .rail-collapsed .proj-tab .num,
+  .rail-collapsed .proj-tab-close { display: none; }
+  .rail-collapsed .proj-tab.on::before { left: 2px; }
   .terminals-wrap {
     position: relative;
     min-height: 0;
@@ -1588,6 +1729,7 @@ const state = {
   // global registry of mounted xterms, indexed by sid (sids are globally unique)
   terms: {},             // sid -> {term, fit, ws, swapping, mounted}
   statusPoll: null,
+  railCollapsed: false,
 };
 
 function proj() {
@@ -1820,12 +1962,12 @@ function viewWorkspace() {
   const tabs = state.projects.map(p => {
     const ag = state.agents[p.agent];
     const isActive = p.id === state.activeProjectId;
-    const label = basename(p.folder);
+    const label = p.name || basename(p.folder);
     return `
       <div class="proj-tab-wrap">
-        <button class="proj-tab ${isActive ? 'on' : ''}" data-pid="${p.id}" title="${escapeHtml(p.folder)} · ⌫ to close" style="--ag:${ag.accent}">
+        <button class="proj-tab ${isActive ? 'on' : ''}" data-pid="${p.id}" title="${escapeHtml(p.folder)} · double-click name to rename · ⌫ to close" style="--ag:${ag.accent}">
           <span class="dot"></span>
-          <span class="label">${escapeHtml(label)}</span>
+          <span class="label" data-pid="${p.id}">${escapeHtml(label)}</span>
           <span class="num">${p.sessions.length}</span>
         </button>
         <button class="proj-tab-close" data-pid="${p.id}" title="close project" aria-label="close project ${escapeHtml(label)}">×</button>
@@ -1876,10 +2018,20 @@ function viewWorkspace() {
         <span class="spacer"></span>
         ${groqState}
       </div>
-      <div class="main main-rail">
+      <div class="main main-rail ${state.railCollapsed ? 'rail-collapsed' : ''}">
         <nav class="proj-rail" aria-label="projects">
-          ${tabs}
-          <button class="proj-add" id="proj-add" title="open another project" aria-label="open another project">+</button>
+          <div class="proj-rail-head">
+            <span class="proj-rail-title">Workspaces</span>
+            <div class="proj-rail-actions">
+              <button class="proj-add" id="proj-add" title="open another project" aria-label="open another project">+</button>
+              <button class="proj-min" id="proj-min" title="collapse / expand workspaces" aria-label="toggle workspaces panel">
+                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2 L4 6 L8 10"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="proj-rail-list">
+            ${tabs}
+          </div>
         </nav>
         <div class="terminals-wrap">
           ${projectStacks}
@@ -2006,6 +2158,12 @@ function wire() {
         }
       };
     });
+    $$('.proj-tab .label').forEach(lbl => {
+      lbl.ondblclick = (e) => {
+        e.stopPropagation();
+        startRenameProject(lbl.dataset.pid);
+      };
+    });
     $$('.proj-tab-close').forEach(b => {
       b.onclick = (e) => {
         e.stopPropagation();
@@ -2013,6 +2171,13 @@ function wire() {
       };
     });
     const addBtn = $('#proj-add'); if (addBtn) addBtn.onclick = newProject;
+    const minBtn = $('#proj-min');
+    if (minBtn) minBtn.onclick = () => {
+      state.railCollapsed = !state.railCollapsed;
+      document.querySelector('.main-rail').classList.toggle('rail-collapsed', state.railCollapsed);
+      // refit all xterms after the grid-column transition settles
+      setTimeout(() => { for (const sid in state.terms) { try { state.terms[sid].fit.fit(); } catch (e) {} } }, 220);
+    };
     $('#send').onclick = sendPrompt;
     const ta = $('#prompt');
     ta.addEventListener('keydown', e => {
@@ -2066,6 +2231,35 @@ async function deleteProject(pid) {
   render();
 }
 
+function startRenameProject(pid) {
+  const lbl = document.querySelector(`.proj-tab .label[data-pid="${pid}"]`);
+  const p = state.projects.find(x => x.id === pid);
+  if (!lbl || !p) return;
+  const fallback = basename(p.folder);
+  const current = p.name || fallback;
+  lbl.innerHTML = `<input class="proj-tab-rename" type="text" value="${escapeHtml(current)}" aria-label="workspace name" />`;
+  const inp = lbl.firstChild;
+  inp.focus();
+  inp.select();
+  let done = false;
+  const commit = (cancel) => {
+    if (done) return;
+    done = true;
+    if (!cancel) {
+      const v = inp.value.trim();
+      p.name = v || fallback;
+    }
+    render();
+  };
+  inp.addEventListener('click', e => e.stopPropagation());
+  inp.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); commit(false); }
+    else if (e.key === 'Escape') { e.preventDefault(); commit(true); }
+  });
+  inp.addEventListener('blur', () => commit(false));
+}
+
 function backToWorkspace() {
   if (!state.projects.length) return;
   state.step = 'work';
@@ -2102,6 +2296,7 @@ async function launch() {
     id: newProjectId(),
     agent: state.draft.agent,
     folder: state.draft.folder,
+    name: basename(state.draft.folder),
     count: state.draft.count,
     sessions: r.sessions,
     tileAgents: Object.fromEntries(r.sessions.map(s => [s, state.draft.agent])),
@@ -2116,10 +2311,12 @@ async function launch() {
 }
 
 function mountTerminals() {
-  // mount any tile (across all projects) that isn't mounted yet
+  // call mountTile for every session every render — if the term already
+  // exists it just gets re-attached from the stash to the new host div,
+  // which is exactly what we need after a re-render parks them off-screen.
   for (const p of state.projects) {
     for (const sid of p.sessions) {
-      if (!state.terms[sid] || !state.terms[sid].mounted) mountTile(sid);
+      mountTile(sid);
     }
   }
 
@@ -2258,7 +2455,12 @@ async function swapTile(sid) {
   const btn = document.querySelector(`.agent-toggle[data-sid="${sid}"]`);
   if (btn) btn.style.setProperty('--ag', a.accent);
 
-  entry.term.reset();
+  // light ANSI clear instead of term.reset() — reset() corrupts the renderer
+  // after the element has been re-parented by the workspace re-render flow,
+  // leaving the tile permanently blank. ESC[2J + ESC[H clears the viewport
+  // through the normal parser path and survives re-parenting just fine.
+  entry.term.write('\x1b[2J\x1b[H');
+  entry.term.write(`\x1b[2m── swapping to ${a.label} ──\x1b[0m\r\n\r\n`);
   entry.swapping = false;
   attachWebSocket(sid);
 }
