@@ -892,6 +892,65 @@ INDEX_HTML = r"""<!doctype html>
     padding: 80px 32px;
     z-index: 1;
   }
+  /* when wizard renders inside a modal, drop fullscreen sizing */
+  .modal-shell .wizard {
+    min-height: 0;
+    padding: 8px 0 0;
+    place-items: stretch;
+  }
+
+  /* ─ modal overlay (for adding projects on top of workspace) ─────────── */
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: color-mix(in oklch, var(--bg) 65%, transparent);
+    backdrop-filter: saturate(160%) blur(12px);
+    -webkit-backdrop-filter: saturate(160%) blur(12px);
+    display: grid;
+    place-items: center;
+    padding: 48px 24px;
+    z-index: 1000;
+    animation: modalFadeIn .18s var(--ease);
+  }
+  .modal-shell {
+    position: relative;
+    background: var(--n-1);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--r-xl);
+    box-shadow: var(--shadow-2);
+    max-width: 820px;
+    width: 100%;
+    max-height: calc(100vh - 96px);
+    overflow: auto;
+    padding: 28px 32px 32px;
+    animation: modalPop .22s var(--ease);
+  }
+  .modal-close {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    width: 28px; height: 28px;
+    background: transparent;
+    border: 1px solid var(--hairline);
+    border-radius: 50%;
+    color: var(--muted);
+    font: 500 16px var(--font-text);
+    line-height: 24px;
+    cursor: pointer;
+    transition: color .12s var(--ease), border-color .12s var(--ease), background .12s var(--ease);
+  }
+  .modal-close:hover {
+    color: var(--heading);
+    border-color: var(--hairline-strong);
+    background: var(--n-2);
+  }
+  @keyframes modalFadeIn {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+  @keyframes modalPop {
+    from { opacity: 0; transform: translateY(8px) scale(.985); }
+    to   { opacity: 1; transform: none; }
+  }
   .stage {
     position: relative;
     width: 100%;
@@ -1581,10 +1640,40 @@ function setAccent(c) {
 function render() {
   const app = $('#app');
   setAccent(accent());
-  if (state.step === 'agent')      app.innerHTML = viewAgent();
-  else if (state.step === 'folder')app.innerHTML = viewFolder();
-  else if (state.step === 'count') app.innerHTML = viewCount();
-  else if (state.step === 'work')  { app.innerHTML = viewWorkspace(); mountTerminals(); }
+
+  const hasProjects = state.projects.length > 0;
+  const inWizard = state.step !== 'work';
+  let html = '';
+
+  // workspace always present when projects exist — keeps xterms alive in DOM
+  if (hasProjects) html += viewWorkspace();
+
+  // wizard either fullscreen (first run) or as modal overlay (over workspace)
+  if (inWizard) {
+    const draftAccent = state.draft.agent && state.agents[state.draft.agent]
+      ? state.agents[state.draft.agent].accent
+      : 'oklch(72% 0.13 250)';
+    let inner = '';
+    if (state.step === 'agent')       inner = viewAgent();
+    else if (state.step === 'folder') inner = viewFolder();
+    else if (state.step === 'count')  inner = viewCount();
+
+    if (hasProjects) {
+      html += `
+        <div class="modal-backdrop" id="modal-backdrop" role="dialog" aria-modal="true" aria-label="add project">
+          <div class="modal-shell" style="--accent: ${draftAccent}; --accent-soft: color-mix(in oklch, ${draftAccent} 20%, transparent); --accent-faint: color-mix(in oklch, ${draftAccent} 10%, transparent);">
+            <button class="modal-close" id="modal-close" aria-label="close">×</button>
+            ${inner}
+          </div>
+        </div>
+      `;
+    } else {
+      html += `<div class="wizard-root" style="--accent: ${draftAccent}; --accent-soft: color-mix(in oklch, ${draftAccent} 20%, transparent); --accent-faint: color-mix(in oklch, ${draftAccent} 10%, transparent);">${inner}</div>`;
+    }
+  }
+
+  app.innerHTML = html;
+  if (hasProjects) mountTerminals();
   wire();
 }
 
@@ -1834,6 +1923,20 @@ function escapeHtml(s) {
 /* ─ wiring ────────────────────────────────────────────────────────── */
 
 function wire() {
+  // wizard-modal dismissal (only when workspace is underneath)
+  const backdrop = document.getElementById('modal-backdrop');
+  if (backdrop) {
+    backdrop.onclick = (e) => {
+      if (e.target === backdrop) backToWorkspace();
+    };
+    const closeBtn = document.getElementById('modal-close');
+    if (closeBtn) closeBtn.onclick = backToWorkspace;
+    document.removeEventListener('keydown', escCloseModal);
+    document.addEventListener('keydown', escCloseModal);
+  } else {
+    document.removeEventListener('keydown', escCloseModal);
+  }
+
   if (state.step === 'agent') {
     $$('.card').forEach(c => c.onclick = () => {
       state.draft.agent = c.dataset.agent;
@@ -1950,7 +2053,15 @@ async function deleteProject(pid) {
 function backToWorkspace() {
   if (!state.projects.length) return;
   state.step = 'work';
+  state.draft = { agent: null, folder: '', count: 4 };
   render();
+}
+
+function escCloseModal(e) {
+  if (e.key === 'Escape' && state.projects.length && state.step !== 'work') {
+    e.preventDefault();
+    backToWorkspace();
+  }
 }
 
 function countKeys(e) {
