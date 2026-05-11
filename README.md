@@ -1,100 +1,90 @@
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="logo-dark.svg">
+  <img src="logo-light.svg" width="72" alt="vibehelper logo">
+</picture>
+
 # vibehelper
 
-A control plane for running multiple terminal coding agents (Claude Code, Gemini CLI) in parallel, with a Groq-powered router that decides which tile each prompt should go to.
+*A calm room for vibe coding with more than one AI agent at a time.*
 
-Open multiple projects as tabs. Each project gets its own grid of real PTY-backed terminals rendered with xterm.js. Type a prompt once, and the smart router (Llama 4 Scout via Groq) picks the right tile — or splits the task across tiles — instead of broadcasting blindly.
+</div>
 
-## What it does
+You pick a folder. You pick how many agents. They each get a real terminal. You type a prompt once, and a small Llama 4 Scout sitting in the middle reads it, looks at who's free, and decides where it should go. Claude Code or Gemini CLI under the hood. Real PTYs, real cursors, real scrollback.
 
-- **Real terminals, not output dumps.** Each tile is xterm.js wired to a server-side PTY over WebSocket. TUIs render properly. Cursor, colours, scroll, paste all behave like a normal terminal.
-- **Multiple projects, side-by-side.** Vertical rail on the left holds tabs; switch between projects without losing state. `+` opens a new project through the wizard.
-- **Smart router instead of broadcast.** Type a prompt; the router examines each tile's agent, status, and last task, then decides: send to one idle tile, split into independent subtasks, or amend a tile that's already mid-task. It never sends the same prompt to two tiles.
-- **Per-tile agent swap.** Click the agent label in any tile's header to flip Claude ↔ Gemini without losing the session slot.
-- **Real status detection.** Tiles show `booting / thinking / working / idle / exited` based on PTY activity and the agent's idle-prompt box pattern — so you know when work is actually done.
-- **Auto-acceptance of trust prompts.** Claude Code's workspace trust dialog and Gemini's trusted-folders prompt are pre-accepted for the chosen folder. No more clicking through dialogs on every spawn.
-- **Native macOS window.** Launches via pywebview (WKWebView under the hood), no browser chrome.
+## The idea
 
-## Requirements
+Most agent CLIs are a one-on-one conversation. You and the model. That's fine, until you want to try three approaches at once, or open two projects and bounce between them, or hand a quick question to one agent while another keeps grinding on a refactor.
 
-- macOS (only platform tested — folder picker uses `osascript`, PTY behaviour is Unix-only)
-- Python with tkinter-compatible build *(see install note below)*
-- Node-installed agent CLIs on your `PATH`:
-  - `npm i -g @anthropic-ai/claude-code`
-  - `npm i -g @google/gemini-cli`
-- A Groq API key (free tier works) — get one at [console.groq.com](https://console.groq.com)
+vibehelper is the room you'd want around that. Tabs on the left, one per project. A grid of terminals on each. A prompt box on the right. And a router in the middle that's actually paying attention.
 
-## Install
+## What's in the box
+
+**Real terminals.** Each tile is an xterm.js front-end wired to a server-side PTY over WebSocket. TUIs render properly. Paste, scrollback, cursor blink, ANSI colours, all of it.
+
+**Several projects, side by side.** A vertical rail on the left holds a tab for each open project. Switch between them without losing state, type in any of them, press `+` to spin up another. Each project keeps its own grid, its own history, its own routing.
+
+**A router, not a megaphone.** When you send a prompt, vibehelper asks Groq to look at every tile's state (which agent, idle or thinking, last prompt) and decide what to do. Sometimes that's "send to the idle tile". Sometimes it's "split into three subtasks". Sometimes it's "amend what tile #2 is already doing, this looks like a course-correction". The same prompt never goes to two tiles at once.
+
+**Per-tile agent swap.** Click the agent label on any tile's header. Claude becomes Gemini, or the other way around, without losing the slot. Useful when you want one tile to keep grinding while another sees the problem through a different model's eyes.
+
+**Status you can trust.** Each tile reports *booting*, *thinking*, *working*, *idle* or *exited* based on PTY traffic and a fingerprint of the idle prompt the agents draw when they're waiting on you. You see when something is actually done.
+
+**No friction on first run.** Claude's workspace-trust dialog and Gemini's trusted-folders prompt are pre-accepted for the folder you picked, so spawn drops you straight into the agent's REPL instead of a yes-no dance.
+
+**A real desktop window.** Launches as a native macOS window via pywebview. No browser chrome, no tab clutter, just the app.
+
+## Getting started
+
+You'll need macOS, a Python with Tk support, the agent CLIs on your `PATH`, and a Groq API key.
 
 ```bash
-git clone https://github.com/<you>/vibehelper.git
-cd vibehelper
-
-# create a venv with a Python that has tkinter / Tk available
-# (on macOS, the system python at /usr/bin/python3 works, or
-#  brew's python@3.14 + python-tk@3.14)
 brew install python-tk@3.14
+git clone https://github.com/virgiliolrf/vibehelper.git
+cd vibehelper
 $(brew --prefix python@3.14)/libexec/bin/python -m venv .venv
-
 .venv/bin/pip install -r requirements.txt
+
+npm i -g @anthropic-ai/claude-code @google/gemini-cli
 ```
 
-## Configure
-
-Drop your Groq key in `~/.config/vibehelper/config.json`:
+Then leave your Groq key where vibehelper expects to find it:
 
 ```bash
 mkdir -p ~/.config/vibehelper
-cat > ~/.config/vibehelper/config.json <<'EOF'
-{ "groq_api_key": "gsk_..." }
-EOF
+echo '{"groq_api_key":"gsk_..."}' > ~/.config/vibehelper/config.json
 chmod 600 ~/.config/vibehelper/config.json
 ```
 
-Alternatively, export `GROQ_API_KEY` in your shell. Env var wins over config file.
+(If you'd rather not put the key on disk, exporting `GROQ_API_KEY` works too. The env var wins.)
 
-The router uses `meta-llama/llama-4-scout-17b-16e-instruct` by default. If your Groq project has it disabled, enable it at [console.groq.com/settings/project/limits](https://console.groq.com/settings/project/limits) or change `GROQ_MODEL` in `vibehelper.py` to something on your allowlist (e.g. `llama-3.3-70b-versatile`).
-
-## Run
+And run it:
 
 ```bash
 .venv/bin/python vibehelper.py
 ```
 
-A native window opens. Wizard takes you through: pick agent → pick folder → pick count → workspace. Press `⌘↵` (or click `Route & send`) to dispatch a prompt.
-
-Force browser mode instead of the native window:
-
-```bash
-.venv/bin/python vibehelper.py --web
-```
+The native window opens on a wizard. Pick an agent, pick a folder, pick a count, hit *Launch*. From there it's just you and the prompt box.
 
 ## Keyboard
 
-| Action | Keys |
-|---|---|
-| Send prompt | `⌘↵` / `Ctrl+↵` |
-| Close project (when tab focused) | `Delete` / `Backspace` |
-| Cycle wizard count | `1`–`8` |
-| Wizard advance | `↵` |
+`⌘↵` (or `Ctrl+↵`) sends a prompt through the router. `Delete` on a focused project tab closes the project after a quick confirm. `Esc` dismisses the *new project* modal. In the wizard, digits `1` through `8` set the agent count.
 
-## Architecture
+## How it works underneath
 
-- **`vibehelper.py`** — single-file FastAPI app. Backend manages PTY sessions; frontend is an inline SPA (HTML/CSS/vanilla JS, no build step) served as the index page.
-- **Sessions** — each tile is one `Session` with a `pty.openpty()` + a child process running `claude` or `gemini`. Output flows: PTY → asyncio reader → WebSocket → xterm.js. Input flows the other way.
-- **Router** — `/api/route` builds a snapshot of all tiles (`sid`, `agent`, `status`, `last_prompt`) and asks Groq for a JSON dispatch plan. Each route gets its prompt written into one specific PTY with `\r` (Enter), preceded by a 40 ms type-then-submit pause that prevents TUI debouncers from eating chars.
-- **Status heuristic** — `thinking` = PTY emitted bytes within last 2 s; `idle` = box-drawing input prompt visible in tail buffer or >5 s of silence; otherwise `working`.
-- **Trust auto-accept** — writes `hasTrustDialogAccepted: true` into `~/.claude.json` for Claude and `~/.gemini/trustedFolders.json` for Gemini before each spawn.
+`vibehelper.py` is one file. FastAPI on the back, an inline single-page app on the front, served as the index page.
 
-## Roadmap
+Each tile is a `Session` object holding a `pty.openpty()` and a child process running `claude` or `gemini`. Bytes flow from the PTY to an asyncio reader to a WebSocket to xterm.js, and back. The router endpoint builds a snapshot of every live tile and asks Groq for a JSON dispatch plan; each chosen route gets its text written into one specific PTY, with a 40 ms pause before the trailing `\r` so the TUI's input debouncer doesn't drop characters.
 
-- [ ] Git worktree per tile, so N agents can edit the same repo without trampling each other
-- [ ] Diff & merge view after agents finish — compare worktrees and pick a winner
-- [ ] Cross-platform folder picker (Linux: `zenity`, Windows: `tkinter.filedialog`)
-- [ ] Real `.app` bundle via `pyinstaller --windowed`
-- [ ] `Shift+⌘↵` to send raw (skip the router)
-- [ ] Custom router system prompt + model selector in the UI
-- [ ] Saved prompt presets / templates
+Status comes from looking at the last two seconds of PTY traffic plus a fingerprint of the agent's idle prompt — the box-drawing characters Claude and Gemini both draw when they're waiting on you.
+
+## Configuration notes
+
+The router uses `meta-llama/llama-4-scout-17b-16e-instruct` by default. If your Groq project has Scout disabled, you can enable it at [console.groq.com/settings/project/limits](https://console.groq.com/settings/project/limits), or change the `GROQ_MODEL` constant near the top of `vibehelper.py` to something on your allowlist (for example, `llama-3.3-70b-versatile`).
+
+To launch in the browser instead of the native window, append `--web`.
 
 ## License
 
-Not yet licensed. All rights reserved by the author for now.
+Not yet decided. If you're curious, open an issue.
