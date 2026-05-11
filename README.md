@@ -87,4 +87,4 @@ To launch in the browser instead of the native window, append `--web`.
 
 ## License
 
-Not yet decided. If you're curious, open an issue.
+vibehelper is licensed under the [GNU GPL v3.0](LICENSE). Use it, fork it, ship it, just keep it open source and credit the original author (Virgilio Filho). Any work derived from this code stays under the same license.

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Virgilio Filho
 """
 vibehelper.py — Vibe Coding Orchestrator
 ========================================
@@ -902,9 +904,7 @@ INDEX_HTML = r"""<!doctype html>
   /* ─ modal overlay (for adding projects on top of workspace) ─────────── */
   .modal-backdrop {
     position: fixed; inset: 0;
-    background: color-mix(in oklch, var(--bg) 65%, transparent);
-    backdrop-filter: saturate(160%) blur(12px);
-    -webkit-backdrop-filter: saturate(160%) blur(12px);
+    background: rgba(0, 0, 0, 0.32);
     display: grid;
     place-items: center;
     padding: 48px 24px;
@@ -1641,6 +1641,22 @@ function render() {
   const app = $('#app');
   setAccent(accent());
 
+  // park every live xterm in an off-screen cache so it survives the
+  // innerHTML reset below. xterm's renderer is fragile when its element
+  // is GC'd from the DOM — keeping a stable parent prevents the blank-out.
+  if (!state._termStash) {
+    state._termStash = document.createElement('div');
+    state._termStash.id = '_term-stash';
+    state._termStash.style.cssText = 'position:absolute;left:-99999px;top:0;width:1px;height:1px;overflow:hidden;visibility:hidden;pointer-events:none;';
+    document.body.appendChild(state._termStash);
+  }
+  for (const sid in state.terms) {
+    const e = state.terms[sid];
+    if (e && e.term && e.term.element && e.term.element.parentElement && e.term.element.parentElement !== state._termStash) {
+      state._termStash.appendChild(e.term.element);
+    }
+  }
+
   const hasProjects = state.projects.length > 0;
   const inWizard = state.step !== 'work';
   let html = '';
@@ -2137,7 +2153,11 @@ function mountTile(sid) {
     if (existing.term.element.parentElement !== el) {
       el.appendChild(existing.term.element);
     }
-    try { existing.fit.fit(); } catch (e) {}
+    // give the browser a frame to lay out the new parent, then fit + redraw
+    requestAnimationFrame(() => {
+      try { existing.fit.fit(); } catch (e) {}
+      try { existing.term.refresh(0, existing.term.rows - 1); } catch (e) {}
+    });
     return;
   }
 
